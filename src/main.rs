@@ -73,8 +73,28 @@ async fn main() -> Result<()> {
     };
     let _ = hi_tx.send(hello.to_json()).await;
 
-    // WebSocket task (wss + Bearer auth, §5).
-    tokio::spawn(ws::run(cfg.remote_url.clone(), cfg.control_token.clone(), hi_rx, lo_rx, in_tx, cancel.clone()));
+    // Transport: relay + E2EE fan-out (§13/§14) when PAIRING_SECRET is set,
+    // else direct wss + bearer (§5, M2).
+    if let Some(pairing) = cfg.pairing_secret.clone() {
+        use claude_pty_controller::e2ee::{self, StaticKey};
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let rendezvous = e2ee::derive_rendezvous_secret(&pairing);
+        let room = e2ee::room_id(&rendezvous, e2ee::current_epoch(now));
+        let key = StaticKey::load_or_create(&cfg.home.join("static_key.json"))?;
+        tracing::info!(room = %room, pubkey = %key.public_b64, enroll = cfg.allow_enroll, "relay/E2EE mode");
+        let rc = claude_pty_controller::relay_client::RelayConfig {
+            url: cfg.remote_url.clone(),
+            relay_token: cfg.relay_token.clone(),
+            room,
+            psk: e2ee::derive_psk(&pairing),
+            static_priv: key.private()?,
+            authz_path: cfg.home.join("authorized_devices.json"),
+            allow_enroll: cfg.allow_enroll,
+        };
+        tokio::spawn(claude_pty_controller::relay_client::run(rc, hi_rx, lo_rx, in_tx, cancel.clone()));
+    } else {
+        tokio::spawn(ws::run(cfg.remote_url.clone(), cfg.control_token.clone(), hi_rx, lo_rx, in_tx, cancel.clone()));
+    }
 
     // Channel-2 transcript watcher (poll + event-triggered + manual refresh, §3.2).
     {

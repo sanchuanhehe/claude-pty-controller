@@ -111,20 +111,24 @@ async fn handle(stream: tokio::net::TcpStream, rooms: Rooms, token: Option<Strin
                     return Ok(());
                 }
                 room.controller = Some(tx.clone());
-                // Tell the controller about dashboards already present.
-                for p in room.dashboards.keys() {
+                send(&tx, &Envelope::Joined); // ack first
+                // Tell the controller about existing dashboards, and tell each
+                // dashboard the controller is now present (so it can initiate).
+                for (p, dtx) in &room.dashboards {
                     send(&tx, &Envelope::PeerJoin { peer: p.clone() });
+                    send(dtx, &Envelope::PeerJoin { peer: CONTROLLER_PEER.into() });
                 }
             }
             Role::Dashboard => {
                 room.dashboards.insert(peer.clone(), tx.clone());
+                send(&tx, &Envelope::Joined); // ack first
                 if let Some(c) = &room.controller {
                     send(c, &Envelope::PeerJoin { peer: peer.clone() });
+                    send(&tx, &Envelope::PeerJoin { peer: CONTROLLER_PEER.into() });
                 }
             }
         }
     }
-    send(&tx, &Envelope::Joined);
     tracing::info!(room = %room_name, ?role, %peer, "joined");
 
     // Route loop.
@@ -159,7 +163,12 @@ async fn handle(stream: tokio::net::TcpStream, rooms: Rooms, token: Option<Strin
         let mut g = rooms.lock().unwrap();
         if let Some(room) = g.get_mut(&room_name) {
             match role {
-                Role::Controller => room.controller = None,
+                Role::Controller => {
+                    room.controller = None;
+                    for dtx in room.dashboards.values() {
+                        send(dtx, &Envelope::PeerLeave { peer: CONTROLLER_PEER.into() });
+                    }
+                }
                 Role::Dashboard => {
                     room.dashboards.remove(&peer);
                     if let Some(c) = &room.controller {
