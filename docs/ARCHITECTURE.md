@@ -1,7 +1,7 @@
 # claude-pty-controller — 架构设计
 
 > 把一台运行 Claude Code 的机器，通过单一静态 Rust 二进制暴露为可远程观测 / 驱动的终端会话。
-> 本文是在初版方案 `方案6-Rust版.md`（源文件已删除,保留在 git 历史中）基础上、修正 `docs/REVIEW.md` 所列缺陷后的落地设计。
+> 本文是在初版方案 `方案6-Rust版.md`（源文件已删除,保留在 git 历史中）基础上、修正其若干缺陷后的落地设计；与原方案的关键差异及原因汇总见 §10。
 
 ## 1. 目标与非目标
 
@@ -18,7 +18,7 @@
 
 ## 2. 进程模型
 
-采用 **Tokio 异步运行时**，而非稿件的手写多线程 —— 这是修正 REVIEW B1（WebSocket 帧拆分）最干净的方式：`tokio-tungstenite` 的 `.split()` 给出各自持有正确帧状态的 `SplitSink`/`SplitStream`，天然支持读写并发、背压、重连。
+采用 **Tokio 异步运行时**，而非原方案的手写多线程 —— 这是规避「裸流克隆绕过 WebSocket 帧封装/掩码」问题最干净的方式：`tokio-tungstenite` 的 `.split()` 给出各自持有正确帧状态的 `SplitSink`/`SplitStream`，天然支持读写并发、背压、重连。
 
 ```
 main (tokio runtime)
@@ -36,7 +36,7 @@ main (tokio runtime)
 - `pty_in_tx/pty_in_rx`：入站命令队列，由单一 `pty_writer` 任务消费。
 - `portable-pty` 的 I/O 是阻塞的：PTY 读、写、JSONL 读都跑在 `tokio::task::spawn_blocking` 或专用线程里，通过 channel 与 async 世界通信。
 
-### 关于 master 句柄（修正 B4）
+### 关于 master 句柄
 `PtySession` 必须**保留 `master`**：`writer`（写子进程 stdin）、`reader`（读子进程 stdout，`try_clone_reader`）、`master`（用于 `resize()`）、`child`（监测退出）。resize 通过 `master.resize(PtySize{rows,cols,..})` 实现，**绝不**往 PTY 写 `\x1b[8;..t`。
 
 ## 3. 三条数据通道
@@ -47,7 +47,7 @@ main (tokio runtime)
 | 二 · 对话内容 | JSONL 文件 | `{"type":"transcript","message":{…}}` |
 | 三 · 状态事件 | OSC 序列 | `{"type":"event","event":"…", …}`（见 §3.3 schema） |
 
-### 3.1 通道一 · 终端画面（修正 B3）
+### 3.1 通道一 · 终端画面
 
 PTY 输出是二进制，UTF-8 多字节会被切在读边界。**不使用 `from_utf8_lossy`。**
 
@@ -59,7 +59,7 @@ PTY 输出是二进制，UTF-8 多字节会被切在读边界。**不使用 `fro
 
 > v1 用方案 A（兼容优先）；若发现异常字节流再切 B。两者可由 CLI flag 切换。
 
-### 3.2 通道二 · 对话内容（修正 M1）
+### 3.2 通道二 · 对话内容
 
 JSONL 路径：`~/.claude/projects/<project-path>/<session-id>.jsonl`。每行一条结构化消息（`user` / `assistant`，含 `tool_use.input`、`tool_result.content`），原样转发为 `transcript`。
 
@@ -79,7 +79,7 @@ loop (poll 250ms 或 notify 事件):
 - session 定位：优先按当前 session-id 锁定；找不到时回退「mtime 最新且非 `timeline.jsonl`」。文件消失/截断时重新发现（已知限制：多 session 并发时定位会抖动，文档标注）。
 - 文件监视：v1 用 250ms 轮询（实现简单、跨平台）；可选 `notify`（inotify）降延迟。
 
-### 3.3 通道三 · 状态事件（修正 B5 / M3 / M4）
+### 3.3 通道三 · 状态事件
 
 **OSC 协议**（从 Claude Code 提取）：
 
@@ -89,13 +89,13 @@ loop (poll 250ms 或 notify 事件):
 - 通知铃 `BEL (0x07)`：任务完成 / 权限请求。
 - tmux 包装：`ESC P tmux ; <escaped> ESC \`，内部 `ESC` 翻倍。
 
-**状态机实现要点（修正 M3）**：整机在 **`&[u8]`** 上运行，缓冲用 `Vec<u8>`，字段提取时才 `str::from_utf8`。状态：`Ground` / `Esc`（见过 ESC）/ `Osc`（ESC ]，累积到 `BEL` 或 `ST=ESC\`）/ `Dcs`（ESC P，累积到 `ESC\`）。
+**状态机实现要点**：整机在 **`&[u8]`** 上运行，缓冲用 `Vec<u8>`，字段提取时才 `str::from_utf8`。状态：`Ground` / `Esc`（见过 ESC）/ `Osc`（ESC ]，累积到 `BEL` 或 `ST=ESC\`）/ `Dcs`（ESC P，累积到 `ESC\`）。
 
 - OSC 终止后，剥掉前缀 `ESC ]` 与终止符（BEL 或 ST），按首个 `;` 切出命令号，分派 0/2、9、21337。
-- DCS（tmux，修正 M4）终止后：剥前缀 `\x1bPtmux;` 和后缀 `\x1b\\`，把内部 `\x1b\x1b` 还原为 `\x1b`，再把还原出的字节喂回 OSC 解析。
+- DCS（tmux）终止后：剥前缀 `\x1bPtmux;` 和后缀 `\x1b\\`，把内部 `\x1b\x1b` 还原为 `\x1b`，再把还原出的字节喂回 OSC 解析。
 - 字节按 8KB 块喂入，状态跨块保留，避免任何按字节切片 panic。
 
-**出站 Event 消息 schema（修正 B5）**：定义单一结构体，扁平 `Option` 字段：
+**出站 Event 消息 schema**：定义单一结构体，扁平 `Option` 字段：
 
 ```rust
 #[derive(Serialize)]
@@ -122,16 +122,16 @@ struct EventMsg {
 
 `input` 在文本后补 `\r`；`raw` 原样写入控制字符；`resize` 调 `master.resize()`（**非**写转义序列）。所有入站经 `pty_writer` 单任务串行执行。
 
-## 5. 安全（修正 M2）
+## 5. 安全
 
 **威胁模型**：控制器 = 远程 shell 注入能力 + 宿主机 `ANTHROPIC_API_KEY` 访问。任何能连上 WS 端点的人即可驱动该机器。因此鉴权是必需项，不是可选项。
 
 - **鉴权**：连接时 `Authorization: Bearer <token>` 头或首帧 `{"type":"auth","token":"…"}`；token 来自环境变量 `CONTROL_TOKEN`，未设置则**拒绝启动**。校验失败立即关闭连接。
 - **传输**：生产强制 `wss://`（rustls）。`ws://` 仅允许 `127.0.0.1` / 显式 `--insecure`。
-- **最小权限**：以非 root 运行；env 注入跳过空值（修正 m2）；不打印 token/key。
+- **最小权限**：以非 root 运行；env 注入跳过空值；不打印 token/key。
 - **可选**：入站命令审计日志、来源 IP 允许列表。
 
-## 6. 依赖（修正 B2）
+## 6. 依赖
 
 ```toml
 [dependencies]
@@ -157,7 +157,7 @@ strip = true
 
 **全链纯 Rust，TLS 走 rustls + webpki-roots，无 OpenSSL / 无 C/C++。** 二进制体积比纯 tungstenite 版略大（tokio + rustls），仍是单文件、数 MB 级、`scp` 即部署。
 
-## 7. 背压与重连（修正 M5）
+## 7. 背压与重连
 
 - `out_tx` 用**有界** channel（容量 1024）。WS 已连：正常发送。WS 断开：`ws_outbound` 不消费，channel 满后 `try_send` 失败 → 对**通道一 output** 采用「丢旧」策略（终端画面是可重建的最终态），对**通道二/三**尽量保序不丢（容量内）。
 - **重连快照**：v1 标注限制——新接入只见后续输出。v2 引入 `vt100` 维护屏幕缓冲，新连接先发一帧 `{"type":"snapshot","screen":"…"}`，再转入实时流。
@@ -165,8 +165,8 @@ strip = true
 
 ## 8. 生命周期
 
-- 启动：解析 env/flag → 校验 `CONTROL_TOKEN` → 起 PTY（直接 spawn `claude`，可配置回退到 `$SHELL`，修正 m3）→ 起各 task → 连 WS。
-- 关闭：`SIGINT`/`SIGTERM` 触发 `CancellationToken`；各 task 收尾；向子进程发 `Ctrl+D`；等待 child 退出（修正 m4）。
+- 启动：解析 env/flag → 校验 `CONTROL_TOKEN` → 起 PTY（直接 spawn `claude`，可配置回退到 `$SHELL`）→ 起各 task → 连 WS。
+- 关闭：`SIGINT`/`SIGTERM` 触发 `CancellationToken`；各 task 收尾；向子进程发 `Ctrl+D`；等待 child 退出。
 - 子进程退出：`pty_reader` 读到 EOF → 通知主流程优雅关闭。
 
 ## 9. 部署
@@ -185,17 +185,17 @@ RUST_LOG=info \
 
 ## 10. 与稿件的差异小结
 
-| 项 | 稿件 | 本设计 | 原因 |
-|----|------|--------|------|
-| 并发模型 | 手写多线程 + 裸流克隆 | tokio + `.split()` | B1 帧封装 |
-| TLS | 无 feature，仅 ws | rustls-tls-webpki-roots | B2 |
-| 通道一编码 | `from_utf8_lossy` | 尾字节缓冲 / base64 | B3 |
-| resize | 写 `\x1b[8;..t` | `master.resize()` | B4 |
-| Event 类型 | 枚举 + `..` | 扁平 `Option` 结构体 | B5 |
-| JSONL 游标 | 文件长度 | 末换行偏移 | M1 |
-| 鉴权 | 无 | 强制 token + wss | M2 |
-| OSC 状态机 | `byte as char` String | `&[u8]` | M3/M4 |
-| 背压 | 无界 channel | 有界 + 丢旧 | M5 |
+| 项 | 原方案 | 本设计 | 原因 |
+|----|--------|--------|------|
+| 并发模型 | 手写多线程 + 裸流克隆 | tokio + `.split()` | 裸流克隆绕过 WebSocket 帧封装/客户端掩码，连接被按协议错误关闭 |
+| TLS | 无 feature，仅 ws | rustls-tls-webpki-roots | 原配置无法 `wss://`，与「无 OpenSSL 安全部署」矛盾 |
+| 通道一编码 | `from_utf8_lossy` | 尾字节缓冲 / base64 | lossy 在 8KB 读边界切坏多字节字符 → 乱码 |
+| resize | 写 `\x1b[8;..t` | `master.resize()` | 写转义序列对内核 PTY 无效，子进程收不到 SIGWINCH |
+| Event 类型 | 枚举 + `..` | 扁平 `Option` 结构体 | 枚举结构体变体不能用 `..` 填充，编译不过 |
+| JSONL 游标 | 文件长度 | 末换行偏移 | 按长度推进会把未闭合的半行永久丢失 |
+| 鉴权 | 无 | 强制 token + wss | 无鉴权 = 远程 shell 注入，RCE 级风险 |
+| OSC 状态机 | `byte as char` String | `&[u8]` | 按字节切片遇非字符边界会 panic；tmux DCS 解包偏移错 |
+| 背压 | 无界 channel | 有界 + 丢旧 | 断连期间无界堆积，重连后灌洪 |
 
 ## 11. 里程碑
 

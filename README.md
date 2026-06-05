@@ -14,8 +14,7 @@
 
 ## 文档
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 落地架构设计
-- [docs/REVIEW.md](docs/REVIEW.md) — 对初版方案的技术评审
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 落地架构设计（§10 含相对初版方案的关键修正与原因）
 
 ## 状态
 
