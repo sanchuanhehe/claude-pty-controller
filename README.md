@@ -1,6 +1,6 @@
 # claude-pty-controller
 
-把一台运行 [Claude Code](https://claude.com/claude-code) 的机器，通过**单一静态 Rust 二进制**暴露为可远程观测 / 驱动的终端会话。`scp` 一个文件即部署，无运行时依赖。
+把一台运行 [Claude Code](https://claude.com/claude-code) 的机器，通过**单一自包含 Rust 二进制**暴露为可远程观测 / 驱动的终端会话。`scp` 一个文件即部署，无运行时依赖（动态链接 glibc；要纯静态用 musl 目标）。
 
 claude 跑在 **tmux** 会话里：控制器 / SSH 断开不影响它继续运行，本地终端可随时 `tmux attach` 与远程 Dashboard **双向透明**共享同一个 claude。
 
