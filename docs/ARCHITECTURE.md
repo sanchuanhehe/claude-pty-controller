@@ -268,5 +268,62 @@ tmux -L claude-ctl attach -t claude-ctl
 1. **M1 骨架**：PTY 跑 tmux `new-session -A` + `allow-passthrough` + 通道一（尾字节缓冲）+ ws_outbound，本地 `ws://127.0.0.1` 跑通画面。
 2. **M2 双向**：入站 input/raw/resize（`master.resize`）+ 鉴权 + wss；验证本地 `tmux attach` 与远程同时透明驱动。
 3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
-4. **M4 健壮性**：有界背压 + 重连退避 + 优雅 detach（保留会话）+ tmux client 退出处理。
-5. **M5（可选）**：vt100 重连快照、notify、base64 模式、子代理转写、审计日志。
+4. **M4 健壮性**：有界背压 + 重连退避 + 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例锁**（§12）。
+5. **M5（可选）**：vt100 重连快照、notify、base64 模式、子代理转写、审计日志、systemd watchdog（§12）。
+
+## 12. 后台常驻 / 进程托管
+
+### 12.1 两层常驻，分别看
+
+| 层 | 谁负责 | 现状 |
+|----|--------|------|
+| **claude 会话** | tmux `new-session -A`（§2.1） | 已常驻：控制器/SSH 断开不影响 claude 继续跑 |
+| **控制器进程**（远程桥 + tail + 解析） | 外部进程守护 | **默认前台**，不自我 daemon 化 —— 见下 |
+
+控制器是普通前台进程：SSH 断 → 收 `SIGHUP` 退出 → **远程桥断**（claude 仍活，但 Dashboard 连不上，直到控制器被重新拉起）。所以「远程随时可达」这个属性，依赖**控制器自身也常驻**。
+
+### 12.2 自愈链（设计依据）
+
+控制器已具备两个幂等的"接管"能力：**WS 自动重连**（§7）+ **`new-session -A` 重接管已存在的 tmux 会话**（§2.1）。因此只要外面套一层**进程守护**，三者组合成全链自愈：
+
+```
+控制器崩溃/被杀  →  守护(systemd)重启  →  new-session -A 接回还活着的 claude 会话
+                                       →  WS 指数退避重连  →  Dashboard 自动恢复
+```
+
+关键前提：**重启必须能无副作用地接管**，这要求控制器满足「单实例 + 无破坏性重连」语义（§12.4）。
+
+### 12.3 托管方案对比
+
+| 方案 | 适用 | 优点 | 取舍 |
+|------|------|------|------|
+| **systemd 服务（推荐）** | 有 root 的 Linux 服务器 | 开机自启、崩溃自动重启、journald 日志、env 隔离、可选 watchdog/沙箱 | 需 root 写 unit |
+| tmux/`setsid nohup` | 无 root / 临时 | 一行起，零配置 | 无自动重启、无开机自启、日志靠重定向 |
+| 内建 `--daemon`（double-fork + `setsid`） | 不想依赖外部守护 | 自包含 | 重造守护逻辑、信号/日志/重启都要自己写，**不推荐**（优先交给 systemd） |
+
+**结论**：v1 不内建 daemon 化；以 systemd 为一等公民部署方式，附 `setsid nohup` 作为无 root 兜底。控制器只需把自己做成「**对前台/被托管两种方式都正确**」的普通进程：
+
+- 默认日志写 stderr（systemd 自动进 journald；裸跑可重定向），`RUST_LOG` 控级别，**绝不打印 token/key**。
+- `SIGTERM`/`SIGINT` → 优雅 detach（保留 tmux 会话，§8），退出码 0；守护视为正常停止。
+- 不写 PID 文件依赖（交给 systemd 跟踪）；单实例靠 flock（§12.4）。
+
+### 12.4 单实例与幂等接管
+
+若一个常驻控制器**和**一个手动拉起的控制器同时连同一会话，会出现：两个进程都 tail 同一 JSONL（转写**重复下发**）、都往同一 PTY 写（输入**交错**）。故须**单实例约束**：
+
+- 启动时对 `${XDG_RUNTIME_DIR:-/tmp}/claude-pty-controller-<session>.lock` 做 `flock(LOCK_EX|LOCK_NB)`；拿不到锁 → 说明已有实例 → **直接退出**（让守护不致起重复实例），或按 flag 改为「抢占：发信号让旧实例 detach 后再接管」。
+- 锁的粒度 = 每个 tmux 会话名一把，未来多会话（非目标 v1）天然隔离。
+- 重连/重启的接管是幂等的：`new-session -A` 不会复制会话；WS 重连重新鉴权；JSONL 游标在进程内重建（重启后从 0 重扫一次或由 Dashboard `refresh:full` 重建，§3.2）。
+
+> 注意：进程重启会丢失内存态游标，重启后首轮可能**重发**部分已发过的转写行。Dashboard 端应按 `uuid` 幂等去重（消息本就带 `uuid`），或重启后等一条 `refresh:full` 重建——二选一，文档标注由前端去重。
+
+### 12.5 存活探测（可选，M5）
+
+systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd-notify` crate，无 C 依赖）发 `READY=1` 与周期 `WATCHDOG=1`。当事件循环卡死（如 PTY 读阻塞、死锁）超过 watchdog 周期未喂狗，systemd 判定僵死并重启 —— 比单纯「进程还在」更真实的存活信号。非 systemd 环境退化为无 watchdog。
+
+### 12.6 落盘物（实现阶段，本次仅设计）
+
+实现时在仓库提供：
+- `deploy/claude-pty-controller.service` — systemd unit（`Type=simple`/可选 `notify`，`Restart=always`，`EnvironmentFile`，非 root `User=`，可选沙箱项 `ProtectSystem`/`NoNewPrivileges`）。
+- `deploy/claude-pty-controller.env.example` — `CONTROL_TOKEN` / `REMOTE_URL` / `ANTHROPIC_*`，权限 `600`。
+- README 增「常驻部署」小节，指向上面两者。
