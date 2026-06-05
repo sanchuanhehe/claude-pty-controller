@@ -4,6 +4,8 @@
 
 claude 跑在 **tmux** 会话里：控制器 / SSH 断开不影响它继续运行，本地终端可随时 `tmux attach` 与远程 Dashboard **双向透明**共享同一个 claude。
 
+**三端 + 端到端加密**：被控端（本仓库）/ 中转端 Relay / 控制端 Dashboard 三端模型，两端主动外连 relay（NAT 友好）。中间流量对 relay **零知识** —— wss 逐跳 TLS + Noise 端到端加密，relay 只转发不透明密文、读不到内容。详见 ARCHITECTURE.md §13–§14。
+
 ## 三条数据通道
 
 | 通道 | 数据源 | WebSocket 消息 |

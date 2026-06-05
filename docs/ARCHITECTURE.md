@@ -15,6 +15,7 @@
 - **本地双向透明**：本地终端可随时 `tmux attach` 接入同一会话，与远程 Dashboard **同时、透明**地观看并驱动同一个 claude（tmux 原生多客户端镜像）。
 - **对话内容低延迟**：通道二除轮询外，由**状态事件触发**和**用户手动刷新**两条额外路径驱动重读（见 §3.2）。
 - 默认安全：强制鉴权，支持 `wss://`（rustls，无 OpenSSL）。
+- **三端 + 端到端加密**：被控端 / 中转端 / 控制端三端模型（§13）；中间流量对中转端**零知识**（E2EE，§14）——relay 只转发不透明密文，读不到内容。
 
 **非目标（v1）**
 - 多会话结构化 fan-out（v1 通道一即透明覆盖单前台会话；后台 agents 的并发 tail + 状态列表为 v2，已实测可行，见 §3.5）。
@@ -250,6 +251,7 @@ claude 在 pane 里会进入各种非常规对话状态：`/resume` 选择器、
 - **传输**：生产强制 `wss://`（rustls）。`ws://` 仅允许 `127.0.0.1` / 显式 `--insecure`。
 - **最小权限**：以非 root 运行；env 注入跳过空值；不打印 token/key。
 - **可选**：入站命令审计日志、来源 IP 允许列表。
+- **三端与令牌拆分**：本节针对**直连**（dashboard 直连被控端 wss）。经中转端时升级为三端模型（§13）+ 端到端加密（§14）：`CONTROL_TOKEN` 升格为 E2EE 根信任 `PAIRING_SECRET`（relay 不可见），relay 接入另用可选 `RELAY_TOKEN`。
 
 ## 6. 依赖
 
@@ -267,6 +269,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 可选：notify = "6"（JSONL inotify）、vt100 = "0.15"（重连屏幕快照）、base64 = "0.22"（通道一方案 B）
+# E2EE（§14）：snow = "0.9"（Noise 协议，纯 Rust）、hkdf + hmac + sha2、chacha20poly1305（若不全用 snow 内建 AEAD）
 
 [profile.release]
 opt-level = 3
@@ -326,15 +329,18 @@ tmux -L claude-ctl attach -t claude-ctl
 | status 取值 | 臆测 generating/approval/idle | 实测 `Idle`/`Working…`/`Waiting` | 与源码 `use-tab-status.ts` 对齐 |
 | jsonl 定位 | 全局 mtime 抢最新 | 项目目录 + 启动前后 jsonl 差集锁定 | 路径 `[^a-zA-Z0-9]→-`，避免多 session 抖动 |
 | 会话切换识别 | 未涉及 | 追踪每行 `sessionId` + 活跃文件复评 | /resume 会换文件（甚至换项目目录），靠行内 `sessionId` 唯一真值重锁（§3.2.1） |
+| 系统拓扑 | 仅被控端 | 被控 / 中转 / 控制 三端 | 双向外连穿透 NAT、多控制端扇出（§13） |
+| 中间加密 | 仅 wss（relay 见明文） | wss + E2EE（Noise），relay 零知识 | 中转端不可信，流量须对其不可读且仍透明转发（§14） |
 
 ## 11. 里程碑
 
 1. **M1 骨架**：PTY 跑 tmux `new-session -A` + `allow-passthrough` + 通道一（尾字节缓冲）+ ws_outbound，本地 `ws://127.0.0.1` 跑通画面。
 2. **M2 双向**：入站 input/raw/resize（`master.resize`）+ 鉴权 + wss；验证本地 `tmux attach` 与远程同时透明驱动。
 3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ **会话切换识别（按行 `sessionId` 重锁，§3.2.1）** + OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
-4. **M4 健壮性**：有界背压 + 重连退避 + 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例锁**（§12）。
-5. **M5（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ vt100 重连快照 + notify + base64 模式 + 审计日志 + systemd watchdog（§12）。
-6. **跨阶段校验**：对照**目标 claude 版本**复核版本敏感常量（OSC/status、JSONL 路径与字段、发现面 schema）—— 见顶部「版本敏感性」。
+4. **M4 三端 + E2EE**（§13/§14）：`relay` binary（room 撮合 + 不透明帧转发）+ 被控端外连 relay + Noise（`snow`）端到端握手与帧加密 + `room id` 派生；验证 relay 抓包仅见密文。
+5. **M5 健壮性**：有界背压 + 重连退避（重连即重握手）+ 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例 / 单 driver 锁**（§12.4）。
+6. **M6（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ 多设备静态密钥 / 吊销（§14 升级路径）+ vt100 重连快照 + notify + base64 + 审计日志 + systemd watchdog（§12）。
+7. **跨阶段校验**：对照**目标 claude 版本**复核版本敏感常量（OSC/status、JSONL 路径与字段、发现面 schema）—— 见顶部「版本敏感性」。
 
 ## 12. 后台常驻 / 进程托管
 
@@ -392,3 +398,51 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 - `deploy/claude-pty-controller.service` — systemd unit（`Type=simple`/可选 `notify`，`Restart=always`，`EnvironmentFile`，非 root `User=`，可选沙箱项 `ProtectSystem`/`NoNewPrivileges`）。
 - `deploy/claude-pty-controller.env.example` — `CONTROL_TOKEN` / `REMOTE_URL` / `ANTHROPIC_*`，权限 `600`。
 - README 增「常驻部署」小节，指向上面两者。
+
+## 13. 系统拓扑：三端模型（被控端 / 中转端 / 控制端）
+
+§1–§12 描述的是**被控端**（controller，跑在 claude 机器上）。完整系统是三端：
+
+| 端 | 角色 | 部署 | 连接方向 |
+|----|------|------|----------|
+| **被控端 Controller** | 本文主体：起 tmux+claude、采三通道、注入输入 | claude 所在机器（常在 NAT/防火墙后） | **主动外连**中转端 |
+| **中转端 Relay** | 不透明帧路由 / 房间撮合 / 背压缓冲 / 多控制端扇出 | 公网可达的小服务 | 监听，接受两端外连 |
+| **控制端 Dashboard** | 操作者界面（浏览器 xterm.js / CLI / 移动端） | 操作者处 | **主动外连**中转端 |
+
+```
+[控制端 Dashboard] ──wss/TLS──┐                         ┌──wss/TLS── [被控端 Controller]
+                              ▼                         ▼
+                          [中转端 Relay]   room 撮合 + 转发不透明密文帧
+                              ▲                         ▲
+       └──────────── E2EE (Noise) 端到端隧道，对 Relay 零知识 ────────────┘
+```
+
+- **双向外连、NAT 友好**：两端都**主动拨出**到 relay，被控机**无需开入站端口**，天然穿透 NAT/防火墙。
+- **房间撮合**：relay 按 `room id`（rendezvous id，§14）把同一对 controller/dashboard 配进一个房间互转。一房间 1 controller + N dashboard。
+- **多控制端 / 谁能驱动**：N 个 dashboard 可同时**观看**；**驱动（写入）单写** —— 被控端只接受当前持锁 driver 的输入（复用 §12.4 单写思路），其余只读，避免输入交错。
+- **透明**：relay 只搬运**不透明密文帧**，不解析、不理解协议 —— §3/§4 的 JSON 消息原样跑在隧道里，换 relay 实现对两端透明。透明与加密**互为因果**：正因 payload 对 relay 不透明，relay 被迫只能当哑转发。
+- **直连特例**：若被控端公网可达，dashboard 可跳过 relay 直连其 `wss`（§5），relay 可选；E2EE 两模式都适用。
+
+## 14. 传输与端到端加密（中间流量对 Relay 不可见）
+
+**威胁前提**：中转端**不可信**（可能是第三方 / 公有服务），它转发的终端流量含代码、密钥、对话 —— 必须让**中间流量对 relay 不可读**，同时保持透明。用**两层加密**：
+
+**第 1 层 · 逐跳 TLS（wss / rustls）**：dashboard↔relay、controller↔relay 每条腿都 wss，防网络窃听、认证 relay 端点。但 relay **终止 TLS**、对它即明文 —— 故需第 2 层。
+
+**第 2 层 · 端到端加密（E2EE，controller↔dashboard，Relay 零知识）** —— "中间流量加密"的核心，relay 只转发密文、**无法解密**：
+
+- **配对根信任（pairing）**：操作者在被控端生成高熵 `PAIRING_SECRET`（即 §5 `CONTROL_TOKEN` 升格），经带外渠道（二维码 / 复制串）录入控制端。**Relay 永不接触它**。
+- **密钥协商（Noise 协议，`snow` 纯 Rust）**：两端经 relay 转发的信道跑一次 **Noise 握手**（如 `Noise_NNpsk0`，PSK = `HKDF(PAIRING_SECRET)`；relay 仅转发握手字节）。产出**每会话对称密钥**，具**前向保密**（临时 DH）+ 互认（有 PSK 才能握手）。重连即重握手 → 新 FS 密钥。
+  - 升级路径：要按设备身份 / 可吊销时，换静态密钥模式（`Noise_XXpsk3` / `KKpsk0`，各端固定密钥对、互相 pin）。
+- **数据帧**：§3/§4 每条 JSON 消息 → 序列化 → Noise transport（AEAD = ChaCha20-Poly1305）加密 → 定长前缀分帧 → 作**二进制不透明帧**交 relay；控制端解密还原。AEAD 自带完整性 / 抗篡改；Noise 计数器 + 序列号抗重放 / 乱序。
+- **房间寻址不泄密**：`room id = HMAC(PAIRING_SECRET, "rendezvous" || epoch)` 截断 —— 两端各自算出同值，relay 据此撮合，但它**不可猜、随 epoch 轮换**，relay 无法长期关联会话，也算不出密钥。
+- **Relay 看得到 / 看不到**：看得到 = `room id`、帧大小、时序、两端 IP；看不到 = 任何明文内容。元数据加固（可选）：长度分桶填充、心跳整形；默认不做、文档标注此泄露面。
+- **Relay 鉴权（防滥用，正交于 E2EE）**：可选 `RELAY_TOKEN` 限制谁能用中转服务（DoS / 配额）。即便冒充者混进房间，无 `PAIRING_SECRET` 也过不了 Noise 握手、读不到任何东西。
+
+**令牌职责拆分**（更新 §5）：
+| 令牌 | 作用 | 谁知道 | Relay 可见 |
+|------|------|--------|-----------|
+| `PAIRING_SECRET` | E2EE 根信任、派生会话密钥与 room id | controller + dashboard | **否** |
+| `RELAY_TOKEN`（可选） | 接入 relay 服务的鉴权 | endpoints + relay | 是 |
+
+**中转端实现**：无业务逻辑的**独立小程序** —— 建议同 Cargo workspace 第二 binary `relay`（或独立部署）。职责仅：endpoint 鉴权（可选 `RELAY_TOKEN`）、room 撮合、不透明帧双向转发、有界缓冲 / 背压（复用 §7 思路）、断连重连、向 N 个 dashboard 扇出。**无状态、可水平扩展**。被控端的 `REMOTE_URL` 即指向它。
