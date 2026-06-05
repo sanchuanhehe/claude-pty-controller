@@ -2,15 +2,17 @@
 
 把一台运行 [Claude Code](https://claude.com/claude-code) 的机器，通过**单一静态 Rust 二进制**暴露为可远程观测 / 驱动的终端会话。`scp` 一个文件即部署，无运行时依赖。
 
+claude 跑在 **tmux** 会话里：控制器 / SSH 断开不影响它继续运行，本地终端可随时 `tmux attach` 与远程 Dashboard **双向透明**共享同一个 claude。
+
 ## 三条数据通道
 
 | 通道 | 数据源 | WebSocket 消息 |
 |------|--------|----------------|
 | 终端画面 | PTY stdout | `{"type":"output","raw":"…"}` |
 | 对话内容 | JSONL 文件 | `{"type":"transcript","message":{…}}` |
-| 状态事件 | OSC 序列 | `{"type":"event","event":"tab_status","status":"generating"}` |
+| 状态事件 | OSC 序列 | `{"type":"event","event":"tab_status","status":"Working…"}` |
 
-入站（远程 → PTY）：`input` / `raw` / `resize`。
+入站（远程 → PTY）：`input` / `raw` / `resize` / `refresh`。通道二除轮询外，还由状态事件（回合结束）和手动 `refresh` 触发刷新。
 
 ## 文档
 
