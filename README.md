@@ -16,7 +16,6 @@
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 落地架构设计
 - [docs/REVIEW.md](docs/REVIEW.md) — 对初版方案的技术评审
-- [方案6-Rust版.md](方案6-Rust版.md) — 原始方案稿
 
 ## 状态
 

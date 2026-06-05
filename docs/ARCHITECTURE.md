@@ -1,7 +1,7 @@
 # claude-pty-controller — 架构设计
 
 > 把一台运行 Claude Code 的机器，通过单一静态 Rust 二进制暴露为可远程观测 / 驱动的终端会话。
-> 本文是在 `方案6-Rust版.md` 基础上、修正 `docs/REVIEW.md` 所列缺陷后的落地设计。
+> 本文是在初版方案 `方案6-Rust版.md`（源文件已删除,保留在 git 历史中）基础上、修正 `docs/REVIEW.md` 所列缺陷后的落地设计。
 
 ## 1. 目标与非目标
 
