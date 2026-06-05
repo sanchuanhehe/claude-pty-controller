@@ -131,6 +131,34 @@ on (poll tick | refresh 信号):
 2. **状态事件触发**（低延迟）：通道三检测到 `tab_status` 由 `Working…` 跃迁到 `Idle`/`Waiting`（=助手回合结束）或收到 bell 时，**立即**发一次 `refresh_tx`，不等下一个轮询 tick —— 回合一结束对话内容就立刻补齐。这是把通道三→通道二耦合起来的关键设计。
 3. **用户手动刷新**：远程下发 `{"type":"refresh"}`（见 §4）。`scope:"tail"` 仅追读增量；`scope:"full"` 把 `last_offset` 归零、从头重发整份转写 —— 供新接入 / 失序的 Dashboard 重建对话。
 
+#### 3.2.1 运行时会话切换识别（/resume、新开、切换）
+
+用户可能在 pane 里 `/resume`、`claude --resume`、或退出后重开 claude —— 此时**活跃 JSONL 会变**：核对源码，resume 走 `switchSession(newSid, projectDir)` 后**追加写到被恢复会话已有的 `<uuid>.jsonl`**，且 `projectDir` 可能**指向另一个项目目录**。启动时锁定的单文件就此失效，必须运行时重新识别。
+
+可用信号按可靠性排序：
+
+1. **每行的 `sessionId`（唯一真值，主信号）**：源码 `sessionStorage.ts` 给每条转写行都盖 `sessionId` + `cwd` 戳（`SerializedMessage`，写入时强制覆盖）。读到的行 `sessionId` **一旦与当前追踪值不同 = 切换**。与文件名/路径无关，最可靠。
+2. **活跃文件 = 当前正在增长的 `*.jsonl`（文件发现）**：单个受控 pane 同一时刻只有一个会话在写，"正在增长的那个"无歧义。每个 poll 复评，非锁定文件开始增长即切换目标。
+3. **OSC 0 标题变化（次要佐证）**：切换会重发 `ESC]0;<title>`（§3.3），可作为"可能切换"的提示去主动复扫；但标题为空时不发，不能单独依赖。
+4. ~~OSC 7 cwd~~：源码**不发** OSC 7，cwd 只在 JSONL 行里 —— 拿不到终端信号。
+
+**识别 + 重锁流程**：
+```
+每个 poll / 收到标题变化提示:
+    scope = 当前 cwd 的项目目录（若锁定文件转静默且 scope 内无增长 → 回退扫全 projects/ 树）
+    active = scope 内最近在增长的 *.jsonl（排除 subagents/、*.meta.json、timeline、bridge-pointer）
+    读 active 行的 sessionId:
+        == 当前 sid 且 == 锁定文件 → 正常 tail（§3.2）
+        != → 会话切换：
+              current_sid = 新 sid；锁定 active；last_offset = 0
+              发 {"type":"session", sessionId, cwd, path, reason:"resume|new|switch"}
+              从头 tail 新文件
+```
+
+**多 claude 实例消歧**：同机若有别的 pane 在写 jsonl，"全局最近增长"可能误指他人会话。用**本 pane 的 `tab_status` 活动窗口**做归属门槛 —— 仅当某文件**在本 pane 处于 `Working…` 期间**增长、或其行 `sessionId` 与既有追踪一致时，才采纳为本会话。把通道三的活动状态耦合进通道二的发现，避免抢错。
+
+**取舍**：切换时 `last_offset=0` 会**重发被恢复会话的全部历史**（resume 文件本含历史）—— 对前端是"完整呈现恢复后的对话"，但大历史有一次性灌洪，靠有界背压（§7）+ 前端按 `uuid` 去重消化。新增出站控制消息 `{"type":"session",…}` 让前端在切换点清空/重建对话视图。
+
 ### 3.3 通道三 · 状态事件
 
 **OSC 协议**（核对 Claude Code 源码 `ink/termio/osc.ts` 等，已修正状态文本）：
@@ -262,12 +290,13 @@ tmux -L claude-ctl attach -t claude-ctl
 | OSC 直通 | 未涉及 | tmux `allow-passthrough on` | 否则 claude 的 DCS 包裹 OSC 被 tmux 丢弃，收不到状态事件 |
 | status 取值 | 臆测 generating/approval/idle | 实测 `Idle`/`Working…`/`Waiting` | 与源码 `use-tab-status.ts` 对齐 |
 | jsonl 定位 | 全局 mtime 抢最新 | 项目目录 + 启动前后 jsonl 差集锁定 | 路径 `[^a-zA-Z0-9]→-`，避免多 session 抖动 |
+| 会话切换识别 | 未涉及 | 追踪每行 `sessionId` + 活跃文件复评 | /resume 会换文件（甚至换项目目录），靠行内 `sessionId` 唯一真值重锁（§3.2.1） |
 
 ## 11. 里程碑
 
 1. **M1 骨架**：PTY 跑 tmux `new-session -A` + `allow-passthrough` + 通道一（尾字节缓冲）+ ws_outbound，本地 `ws://127.0.0.1` 跑通画面。
 2. **M2 双向**：入站 input/raw/resize（`master.resize`）+ 鉴权 + wss；验证本地 `tmux attach` 与远程同时透明驱动。
-3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
+3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ **会话切换识别（按行 `sessionId` 重锁，§3.2.1）** + OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
 4. **M4 健壮性**：有界背压 + 重连退避 + 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例锁**（§12）。
 5. **M5（可选）**：vt100 重连快照、notify、base64 模式、子代理转写、审计日志、systemd watchdog（§12）。
 
