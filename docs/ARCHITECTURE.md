@@ -16,6 +16,7 @@
 - **对话内容低延迟**：通道二除轮询外，由**状态事件触发**和**用户手动刷新**两条额外路径驱动重读（见 §3.2）。
 - 默认安全：强制鉴权，支持 `wss://`（rustls，无 OpenSSL）。
 - **三端 + 端到端加密**：被控端 / 中转端 / 控制端三端模型（§13）；中间流量对中转端**零知识**（E2EE，§14）——relay 只转发不透明密文，读不到内容；**每设备静态密钥身份、可吊销**。
+- **Agent 无关（适配器层）**：核心与具体 agent 解耦，新 agent TUI 只需写一个 `AgentAdapter`（§16）；通道一对任何 TUI 零-adapter 可用，Claude 是首个 adapter。
 
 **非目标（v1）**
 - 多会话结构化 fan-out（v1 通道一即透明覆盖单前台会话；后台 agents 的并发 tail + 状态列表为 v2，已实测可行，见 §3.5）。
@@ -81,6 +82,8 @@ tmux -L claude-ctl set -g window-size latest      # 多客户端时以最新 att
 `PtySession` 必须**保留 `master`**：`writer`（写 tmux-client stdin）、`reader`（读 tmux-client stdout，`try_clone_reader`）、`master`（用于 `resize()`）、`child`（tmux client 进程，监测退出）。resize 通过 `master.resize(PtySize{rows,cols,..})` 实现，**绝不**往 PTY 写 `\x1b[8;..t`。
 
 ## 3. 三条数据通道
+
+> §3.x 是 **Claude 的具体实现（`ClaudeAdapter`）**。其中通道一对任何 agent 通用；通道二/三的 agent 专属部分由 §16 的 `AgentAdapter` 抽象，规范化线缆 schema 见 §16.3。
 
 | 通道 | 数据源 | 出站消息 |
 |------|--------|----------|
@@ -336,10 +339,10 @@ tmux -L claude-ctl attach -t claude-ctl
 
 1. **M1 骨架**：PTY 跑 tmux `new-session -A` + `allow-passthrough` + 通道一（尾字节缓冲）+ ws_outbound，本地 `ws://127.0.0.1` 跑通画面。
 2. **M2 双向**：入站 input/raw/resize（`master.resize`）+ 鉴权 + wss；验证本地 `tmux attach` 与远程同时透明驱动。
-3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ **会话切换识别（按行 `sessionId` 重锁，§3.2.1）** + OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
+3. **M3 通道二/三（= `ClaudeAdapter`，§16 适配器层首个实现）**：jsonl 差集锁定 + tail（末换行游标）+ **会话切换识别（按行 `sessionId` 重锁，§3.2.1）** + OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）+ 出站走规范 schema（§16.3）。
 4. **M4 三端 + E2EE**（§13/§14）：`relay` binary（room 撮合 + 不透明帧转发）+ 被控端外连 relay + **静态密钥身份**（稳态 `Noise_IK` + 入网 `Noise_XXpsk3`，`snow`）+ **授权设备表 / 吊销**（热加载、踢在用会话）+ AEAD 帧 + `room id` 派生；验证 relay 抓包仅见密文、吊销设备即刻失联。
 5. **M5 健壮性**：有界背压 + 重连退避（重连即重握手）+ 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例 / 单 driver 锁**（§12.4）。
-6. **M6（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ vt100 重连快照 + notify + base64 + 审计日志 + systemd watchdog（§12）+ **原生 Windows `ConPtyHost`**（§15，v1 已可经 WSL2 运行）。
+6. **M6（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ vt100 重连快照 + notify + base64 + 审计日志 + systemd watchdog（§12）+ **原生 Windows `ConPtyHost`**（§15，v1 已可经 WSL2 运行）+ **`GenericAdapter` + 第二个 agent adapter** 验证 §16 抽象。
 7. **跨阶段校验**：对照**目标 claude 版本**复核版本敏感常量（OSC/status、JSONL 路径与字段、发现面 schema）—— 见顶部「版本敏感性」。
 
 ## 12. 后台常驻 / 进程托管
@@ -482,5 +485,86 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 | 配置路径 | `~/.claude` | `%USERPROFILE%\.claude`（`dirs` crate 处理） |
 
 > 结论：Windows 上**通道二 / 三、多会话、E2EE、relay 全部 v1 即可用**；唯一需平台分叉的是"会话宿主"—— v1 用 **WSL2** 直接拿到完整能力，原生 `ConPtyHost` 列 v2/v3。标题信号差异已由按行 `sessionId` 兜底。（Windows 具体行为应在 Windows 构建上复核，见顶部「版本敏感性」。）
+
+## 16. 适配器层：兼容其他 agent TUI
+
+核心（PTY / 会话宿主、WebSocket、relay、E2EE、背压、常驻）**与具体 agent 无关**；只有"三通道里 agent 专属的部分"需要适配。把它收进一个 `AgentAdapter` 抽象 —— **新工具只要写个 adapter 就能支持**。Claude 的 §3.2/§3.3/§3.5 即第一个实现 `ClaudeAdapter`。
+
+### 16.1 分层：哪些通用、哪些要 adapt
+
+| 通道 | agent 专属？ | 说明 |
+|------|:---:|------|
+| **通道一 · 屏幕** | **否（零-adapter 基线）** | 任何 TUI 都跑在 PTY 里 → 屏幕镜像**对所有 agent 天然可用**。没 adapter 也能远程看 / 驱（§3.4 的"模式无关"推广到"agent 无关"）。 |
+| **通道二 · 转写** | **是** | 对话持久化的位置与格式各家不同（Claude=JSONL；别家=md / sqlite / 无）。adapter 负责**定位源 + 解析成规范事件**。 |
+| **通道三 · 状态** | **是** | 状态信号机制各异（Claude=OSC 21337+bell；别家=别的 OSC / 标记 / 无 → 从屏幕或转写推断）。adapter 负责**产出规范状态**。 |
+
+> 关键：**通道一是零-adapter 通用底线，通道二/三按 adapter 渐进增强**。全新工具即便没 adapter，也能当纯屏幕镜像远程用；写了 adapter 才有结构化对话与状态。支持成本**单调递增**：先白嫖通道一，再按需补二/三。
+
+### 16.2 `AgentAdapter` 抽象（设计级）
+
+```rust
+trait AgentAdapter {
+    fn id(&self) -> &str;                        // "claude" | "aider" | …
+    fn capabilities(&self) -> Capabilities;      // {transcript, status, multi_session, launch}
+
+    fn launch_spec(&self, cfg: &Cfg) -> LaunchSpec;       // 命令/参数/env（交宿主 tmux/ConPTY 运行）
+    fn discover(&self, ctx: &Ctx) -> Vec<SessionRef>;     // 会话发现（多会话；单会话返回一个），见 16.4
+
+    // 通道二
+    fn transcript_sources(&self, s: &SessionRef) -> Vec<Source>;                  // 要 tail 的文件/流
+    fn parse_transcript(&self, raw: &[u8], src: &Source) -> Vec<TranscriptEvent>; // → 规范
+
+    // 通道三
+    fn status_strategy(&self) -> StatusStrategy;          // Osc | TranscriptDerived | Registry | ScreenHeuristic | None
+    fn parse_status(&self, input: StatusInput) -> Option<StatusEvent>;            // → 规范
+}
+```
+
+核心不认识任何 agent，只调 trait。Adapter 选择：按启动命令名映射 / `--adapter <id>` 显式 / 默认 `GenericAdapter`（仅通道一 + 可选屏幕启发式状态）。
+
+### 16.3 规范化线缆 schema（Dashboard 面向它 → 换 adapter 前端零改）
+
+```jsonc
+// 通道一（通用，多会话加 session 标签）
+{"type":"output","session":"<id>","raw":"…"}
+
+// 通道二：规范转写事件（+ raw 逃生舱保真）
+{"type":"transcript","v":1,"agent":"claude","session":"<id>","ts":169..,
+ "role":"user|assistant|tool|system",
+ "parts":[ {"kind":"text","text":"…"}
+         | {"kind":"tool_use","id":"…","name":"Bash","input":{…}}
+         | {"kind":"tool_result","forId":"…","content":"…"} ],
+ "raw":{…}}                       // agent 原生记录，供高保真/调试，可选
+
+// 通道三：规范状态事件
+{"type":"event","v":1,"agent":"claude","session":"<id>",
+ "state":"idle|working|waiting_input|awaiting_approval|notify",
+ "detail":{…},"raw":{…}}
+```
+
+> 相对现有 `{"type":"transcript","message":{Claude原生}}` 的演进 = **规范字段 + `raw` 逃生舱**。ClaudeAdapter 既填规范 `parts`、也带 `raw`（Claude JSONL 行），保真不丢；前端按规范 schema 写，任何 adapter 通用。
+
+### 16.4 会话发现策略（枚举）
+
+- `Cli { cmd, parse }`：跑命令拿 JSON（Claude = `claude agents --json`，§3.5）。
+- `FsWatch { glob, identity }`：监视文件、按某字段认会话（Claude = `projects/**/<sid>.jsonl` + 行内 `sessionId`，§3.2.1）。
+- `Single`：就一个前台会话。
+- `None`：不做结构化发现，退到通道一。
+
+### 16.5 Claude = 首个 adapter（把已有设计归位）
+
+`ClaudeAdapter`：`launch`=`claude`；`discover`=`Cli(claude agents --json)` ∪ `FsWatch(projects 树)`；`transcript_sources`=`<sid>.jsonl`（+ v2 子代理 sidechain）；`parse_transcript`=Claude JSONL→规范 parts；`status_strategy`=前台 `Osc`(21337/bell，§3.3) + 后台 `Registry`(sessions/*.json `status`，§3.5)。即 §3.2–§3.5 全部归入此 adapter。
+
+### 16.6 适配一个新工具要回答的四问（示例，均须按该工具实测核对）
+
+以假想 `foo` TUI 为例，写 `FooAdapter` 即回答：
+1. **怎么启动** → `launch_spec`。
+2. **对话写哪、什么格式** → `transcript_sources` + `parse_transcript`（把 foo 的历史文件 / SQLite / stdout 结构化成规范 parts）。**查不到就声明 `capabilities.transcript=false`**，退化到通道一。
+3. **状态怎么知道** → `status_strategy`：有 OSC 就 `Osc`；否则从转写推断（`TranscriptDerived`，如"出现 assistant 新消息=working→完成=idle"）；再否则屏幕启发式或 `None`。
+4. **多会话吗** → `discover` 策略；没有就 `Single`。
+
+> **优雅降级是一等公民**：adapter 按 `capabilities` 声明能力，核心据此只发能发的通道。最坏（无 adapter / 全 false）= 纯通道一镜像，仍可远程操作。各工具的转写位置 / 状态机制属**外部易变细节**，按目标工具版本实测（同顶部「版本敏感性」），adapter 把差异**隔离在一个文件里**，核心不动。
+
+> 命名注记：仓库名 `claude-pty-controller` 是历史名；架构上 Claude 只是首个 adapter，工具本身是"agent-TUI 远程控制器"。
 
 **中转端实现**：无业务逻辑的**独立小程序** —— 建议同 Cargo workspace 第二 binary `relay`（或独立部署）。职责仅：endpoint 鉴权（可选 `RELAY_TOKEN`）、room 撮合、不透明帧双向转发、有界缓冲 / 背压（复用 §7 思路）、断连重连、向 N 个 dashboard 扇出。**无状态、可水平扩展**。被控端的 `REMOTE_URL` 即指向它。
