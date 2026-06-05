@@ -191,7 +191,8 @@ on (poll tick | refresh 信号):
 - OSC 终止后，剥掉前缀 `ESC ]` 与终止符（BEL 或 ST），按首个 `;` 切出命令号，分派 0/2、9、21337。
 - DCS 终止后：tmux → 剥前缀 `\x1bPtmux;`、后缀 `\x1b\\`，把内部 `\x1b\x1b` 还原为 `\x1b`；screen → 剥 `\x1bP`/`\x1b\\`、不还原；再把内层字节喂回 OSC 解析。
 - 字节按 8KB 块喂入，状态跨块保留，避免任何按字节切片 panic。
-- **回合结束钩子**：解析出 `tab_status` 从 `Working…` 跃迁到 `Idle`/`Waiting`、或收到 bell 时，除发 Event 外，同时向 `refresh_tx` 发一次信号触发通道二刷新（§3.2）。
+- **健壮性**：① 状态匹配按 `indicator` 颜色 / `status` 前缀（`Working` 含 U+2026 省略号,匹配前缀而非精确字面,避免编码/版本漂移）;② 只认 OSC `21337`/`9;4`,不被 pane 内**其他程序**的 OSC（如别的程序设标题/进度）误触发——尤其 OSC `0` 标题来源不限于 claude,**不能**单独据它判会话切换（§3.2.1 已降级为次要佐证）;③ CSI（`ESC [ …`）等非 OSC/DCS 序列在状态机里走 Ground、不误入 OSC。
+- **回合结束钩子**：解析出 `tab_status` 从 `Working…` 跃迁到 `Idle`/`Waiting` 时，除发 Event 外，同时向 `refresh_tx` 发一次信号触发通道二刷新（§3.2）。bell 仅作尽力而为提示、不作权威回合界（§16.3 ADP-6）。
 
 **出站 Event 消息 schema**：定义单一结构体，扁平 `Option` 字段：
 
@@ -602,4 +603,19 @@ trait AgentAdapter {
 
 > 命名注记：仓库名 `claude-pty-controller` 是历史名；架构上 Claude 只是首个 adapter，工具本身是"agent-TUI 远程控制器"。
 
-**中转端实现**：无业务逻辑的**独立小程序** —— 建议同 Cargo workspace 第二 binary `relay`（或独立部署）。职责仅：endpoint 鉴权（可选 `RELAY_TOKEN`）、room 撮合、不透明帧双向转发、有界缓冲 / 背压（复用 §7 思路）、断连重连、向 N 个 dashboard 扇出。**无状态、可水平扩展**。被控端的 `REMOTE_URL` 即指向它。
+**中转端实现**：无业务逻辑的**独立小程序** —— 建议同 Cargo workspace 第二 binary `relay`（或独立部署）。职责仅：endpoint 鉴权（`RELAY_TOKEN`，经 relay 时**必需**，§13）、room 撮合、不透明帧双向转发、**每连接**有界队列 / 背压（§13——relay 只见密文,不能复用 §7 的通道感知丢旧）、断连重连、把被控端的 **per-dashboard 密文**分发到对应连接（**非**复制同一帧给所有人,§14 扇出加密）。**有每实例 room 软状态**：多实例须按 room id 粘性路由或共享撮合注册表（§13），非真无状态。被控端 `REMOTE_URL` 指向它。
+
+## 17. 已知缺口与评审待办（落地前须决议）
+
+本文经两轮独立多 agent 评审（对 claude v2.1.163 + tmux 3.4 + Cargo.lock 实测）。下列为尚未在正文展开、落地前须决议的横切项：
+
+- 🔴 **两个 BLOCKER 的方案落定**：(1) 入网抗主动 relay —— `PAIRING_SECRET` 强制高熵 vs 引入 PAKE（§14）；(2) 成对 E2EE 的 per-dashboard 扇出加密阶段（§13/§14）须真正进 §2 进程模型与 §7 背压。
+- **控制端 Dashboard 契约未规格化**：前端只在零散处提及；需单独定义其消费的规范 schema（§16.3）、`hello` 能力协商、重连/快照/去重行为。
+- **机密红action（未决策）**：claude 屏幕与 `tool_result` 会滚过 API key/密钥 → 通道一/二**虽 E2EE 但原样送达任何已授权 dashboard**。是否有意?至少文档化;考虑可选脱敏/打码。
+- **协议版本**：`hello` 播报 max `v` + 加法保 `v:1`/忽略未知（§16.3 ADP-5）已定方向，但需写出破坏性升级流程。
+- **缺整体规格的运维面**：错误/失败分类法、测试策略（尤其 OSC 状态机 / JSONL tail 的单元+模糊测试）、可观测性/指标、限流、审计日志、统一**配置 schema**（env/flag 优先级，§12 OPS-8）。
+- **录制/回放、屏幕快照（vt100）** 仍为 v2（§7）。
+- **依赖未验证**：`snow`/PAKE/`flock`/`sd-notify` 均未入 `Cargo.toml`（§6/§12）—— M4/M5 落地前补齐并 `cargo check`。
+- **平台**：原生 Windows `ConPtyHost`（mini-tmux 级工作量）+ msvc 工具链（§15）。
+
+> 详细发现（含每条实测命令与证据）见各 §的 ⚠️ 评审注与 git 历史的两轮评审 commit。
