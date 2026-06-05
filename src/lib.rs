@@ -1,0 +1,9 @@
+//! claude-pty-controller — library crate (testable cores + wiring blocks).
+//! The binary (`main.rs`) composes these. See `docs/ARCHITECTURE.md`.
+
+pub mod adapter;
+pub mod channels;
+pub mod config;
+pub mod proto;
+pub mod pty;
+pub mod ws;
