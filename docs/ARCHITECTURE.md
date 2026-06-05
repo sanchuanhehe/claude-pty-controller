@@ -20,7 +20,7 @@
 **非目标（v1）**
 - 多会话结构化 fan-out（v1 通道一即透明覆盖单前台会话；后台 agents 的并发 tail + 状态列表为 v2，已实测可行，见 §3.5）。
 - 录制回放、持久化历史（仅内存快照）。
-- Windows（`portable-pty` 支持，但 tmux 模型为 Unix-only，v1 只验证 Linux/macOS）。
+- 原生 Windows 的**会话宿主**（v1 经 **WSL2** 即获完整能力；原生 ConPTY 宿主为 v2/v3，§15）。其余能力（通道二/三、多会话、E2EE、relay）本就跨平台。
 
 ## 2. 进程模型
 
@@ -339,7 +339,7 @@ tmux -L claude-ctl attach -t claude-ctl
 3. **M3 通道二/三**：jsonl 差集锁定 + tail（末换行游标）+ **会话切换识别（按行 `sessionId` 重锁，§3.2.1）** + OSC 状态机（`&[u8]` + tmux/screen 解包）+ 三源刷新（轮询 / 状态事件 / 手动）。
 4. **M4 三端 + E2EE**（§13/§14）：`relay` binary（room 撮合 + 不透明帧转发）+ 被控端外连 relay + **静态密钥身份**（稳态 `Noise_IK` + 入网 `Noise_XXpsk3`，`snow`）+ **授权设备表 / 吊销**（热加载、踢在用会话）+ AEAD 帧 + `room id` 派生；验证 relay 抓包仅见密文、吊销设备即刻失联。
 5. **M5 健壮性**：有界背压 + 重连退避（重连即重握手）+ 优雅 detach（保留会话）+ tmux client 退出处理 + **单实例 / 单 driver 锁**（§12.4）。
-6. **M6（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ vt100 重连快照 + notify + base64 + 审计日志 + systemd watchdog（§12）。
+6. **M6（v2 / 可选）**：**后台 agents 多会话 fan-out**（发现面 `sessions/*.json` / `agents --json` + 并发 tail + 免-OSC 状态，§3.5）+ 子代理嵌套 tail（§3.4）+ vt100 重连快照 + notify + base64 + 审计日志 + systemd watchdog（§12）+ **原生 Windows `ConPtyHost`**（§15，v1 已可经 WSL2 运行）。
 7. **跨阶段校验**：对照**目标 claude 版本**复核版本敏感常量（OSC/status、JSONL 路径与字段、发现面 schema）—— 见顶部「版本敏感性」。
 
 ## 12. 后台常驻 / 进程托管
@@ -449,5 +449,38 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 | `RELAY_TOKEN`（可选） | 接入 relay 服务鉴权 | endpoints + relay | 是 | 长期 |
 
 被控端静态私钥与授权表落 `${CLAUDE_PTY_HOME:-~/.claude-pty-controller}/`（权限 `600`）；dashboard 私钥存于其本地安全存储。
+
+## 15. Windows 支持
+
+**绝大部分已跨平台**（纯 Rust 依赖 + 文件 / CLI 接口）；唯一与 Unix 强耦合的是 tmux 承担的"会话宿主"角色。
+
+**已跨平台、零改动**：
+- **中转端、E2EE、wss、令牌与吊销**：rustls / snow / tungstenite 全跨平台。
+- **通道二**：JSONL tail + 会话切换识别 + **后台 agents 多会话发现**（`claude agents --json`、`%USERPROFILE%\.claude\` 下的 `sessions\*.json` / `daemon\roster.json`）—— 纯文件 / CLI，天然跨平台（§3.2 / §3.5）。"一终端多 session" 在 Windows 上**不依赖 tmux**（后台 agent 本就无头）。
+- **通道三**：OSC 状态机是字节级的（§3.3），可移植。
+- 输入注入、WebSocket、背压、单实例锁（Windows 用具名互斥量 / 文件锁）。
+- **PTY**：`portable-pty` 在 Windows 走 **ConPTY**（Win10 1809+）；单 `.exe` 交叉编译 `x86_64-pc-windows-msvc`。
+
+**唯一缺口 = tmux 的"会话宿主"职责**（持久留存 + 本地双向 attach + 多客户端镜像，§2.1）。Windows 无 tmux，两条路线：
+
+- **路线 A · WSL2（推荐，v1 即可用）**：在 WSL2 里跑被控端 → **完整 Unix/tmux 模型原样适用、零改动**，覆盖多数 Windows 开发者。v1 的 Windows 支持 = "在 WSL2 中运行"。
+- **路线 B · 原生 ConPTY + 自建会话宿主（v2/v3）**：把 tmux 那层抽象成 `SessionHost` trait，双实现：
+  - `TmuxHost`（Unix / WSL）= 现状。
+  - `ConPtyHost`（原生 Windows）= 一个**独立长存的会话宿主进程**（Windows 服务 / 分离进程）持有 ConPTY + claude；控制器经**命名管道** attach。关键：ConPTY 由创建进程拥有、进程退则 claude 亡 —— 故**持久留存必须靠这个独立宿主进程**，控制器重启后经命名管道重接管；本地"双向透明" = 第二个命名管道客户端镜像 I/O（自实现 tmux 的多客户端角色）。
+
+**平台差异表**：
+
+| 维度 | Unix（tmux） | 原生 Windows |
+|------|-------------|-------------|
+| 会话宿主 / 持久 | tmux `new-session -A` | 独立 `ConPtyHost` 进程 + 命名管道 attach |
+| 本地双向 | `tmux attach` 多客户端 | 第二个命名管道客户端 |
+| resize | `master.resize()` | ConPTY resize（同 API） |
+| 标题信号 | claude 发 **OSC 0** | claude 用 **`SetConsoleTitle`（`process.title`），非 OSC** → §3.2.1 的"标题切换提示"在原生 Windows 失效，退回**按行 `sessionId`**（仍是唯一真值，不影响识别） |
+| tab_status | OSC 21337（tmux DCS 包裹） | OSC 21337（无 tmux，**裸 OSC，更简单**） |
+| 信号 | SIGHUP/TERM/WINCH | 控制台控制事件 / Job Object；`ctrlc` |
+| 常驻（§12） | systemd | **Windows 服务**（或任务计划 / NSSM），自愈链同构 |
+| 配置路径 | `~/.claude` | `%USERPROFILE%\.claude`（`dirs` crate 处理） |
+
+> 结论：Windows 上**通道二 / 三、多会话、E2EE、relay 全部 v1 即可用**；唯一需平台分叉的是"会话宿主"—— v1 用 **WSL2** 直接拿到完整能力，原生 `ConPtyHost` 列 v2/v3。标题信号差异已由按行 `sessionId` 兜底。（Windows 具体行为应在 Windows 构建上复核，见顶部「版本敏感性」。）
 
 **中转端实现**：无业务逻辑的**独立小程序** —— 建议同 Cargo workspace 第二 binary `relay`（或独立部署）。职责仅：endpoint 鉴权（可选 `RELAY_TOKEN`）、room 撮合、不透明帧双向转发、有界缓冲 / 背压（复用 §7 思路）、断连重连、向 N 个 dashboard 扇出。**无状态、可水平扩展**。被控端的 `REMOTE_URL` 即指向它。
