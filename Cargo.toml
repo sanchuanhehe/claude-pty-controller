@@ -24,6 +24,7 @@ snow = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+sd-notify = "0.4"
 
 # Optional (see docs/ARCHITECTURE.md):
 # notify = "6"      # JSONL inotify instead of polling
