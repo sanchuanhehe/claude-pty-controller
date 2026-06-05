@@ -33,6 +33,8 @@ pub struct RelayConfig {
     /// (TOFU-under-PSK). When false (steady state), only authorized keys connect
     /// — this is what makes revocation stick (a removed key can't re-enroll).
     pub allow_enroll: bool,
+    /// The `hello` frame (capabilities) sent to each dashboard once its E2EE is up.
+    pub hello: String,
 }
 
 enum Peer {
@@ -178,9 +180,14 @@ where
                                 || (cfg.allow_enroll && authz.add(&remote, &from, now()).is_ok());
                             if authorized {
                                 match (*hs).into_transport() {
-                                    Ok(t) => {
+                                    Ok(mut t) => {
+                                        // Greet the fresh dashboard with capabilities (§16.3 ADP-4).
+                                        if let Ok(ct) = t.encrypt(cfg.hello.as_bytes()) {
+                                            let e = Envelope::Msg { to: from.clone(), data: B64.encode(&ct) };
+                                            sink.send(Message::Text(e.to_json())).await?;
+                                        }
                                         peers.insert(from.clone(), Peer::Ready(Box::new(t)));
-                                        tracing::info!(%from, "relay: dashboard authenticated (E2EE up)");
+                                        tracing::info!(%from, "relay: dashboard authenticated (E2EE up); sent hello");
                                     }
                                     Err(e) => tracing::warn!(%from, error=%e, "transport init failed"),
                                 }

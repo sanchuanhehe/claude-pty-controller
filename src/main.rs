@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
             static_priv: key.private()?,
             authz_path: cfg.home.join("authorized_devices.json"),
             allow_enroll: cfg.allow_enroll,
+            hello: hello.to_json(),
         };
         tokio::spawn(claude_pty_controller::relay_client::run(rc, hi_rx, lo_rx, in_tx, cancel.clone()));
     } else {
