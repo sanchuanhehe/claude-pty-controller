@@ -306,7 +306,7 @@ strip = true
 - 启动：解析 env/flag → 校验 `CONTROL_TOKEN` → 记录项目目录现有 `*.jsonl` 集合（§3.2 会话锁定）→ 起 PTY 跑 `tmux new-session -A`（§2.1）并设 `allow-passthrough all` / `status off`（§2.1）→ **接管已存在会话时用 `master.resize()` 显式设回几何**（`-x/-y` 实测在接管路径被忽略）→ 锁定新出现的 jsonl → 起各 task → 连 WS。
 - 关闭：`SIGINT`/`SIGTERM` 触发 `CancellationToken`；各 task 收尾；**控制器 detach（不 kill）**——tmux 会话与 claude **继续后台留存**，下次以同名 `new-session -A` 接管。
 - 仅当显式 `--shutdown-session` 时才 `tmux kill-session` 真正结束 claude。
-- **tmux client EOF（reader EOF）必须先消歧**（实测：`kill-session` 与 `detach` 在 EOF 层**无法区分**，都是干净 EOF / 退出码 0）：收到 EOF 后查 `tmux -L claude-ctl has-session -t claude-ctl` —— 会话**仍在** → detach，重 attach；**已无** 且非 `--shutdown-session` → 按策略重建；**是显式 shutdown** → 退出，**不让 `-A` 复活**刚被杀的会话。
+- **tmux client EOF（reader EOF）必须先消歧**（实测：`kill-session` 与 `detach` 在 EOF 层**无法区分**，都是干净 EOF / 退出码 0）：收到 EOF 后查 `tmux -L claude-ctl has-session -t claude-ctl` —— 会话**仍在** → detach，重 attach；**已无** → **默认退出（尊重带外 `kill-session`）**,仅当显式 `--recreate-on-missing` 才重建。⚠️ 否则 `Restart=always` + `new-session -A` 会**把操作者刚带外杀掉的会话复活**（评审）——权威停止路径应是 `systemctl stop`（SIGTERM=detach、claude 留存）,真要结束 claude 用 `--shutdown-session`。
 
 ## 9. 部署
 
@@ -397,15 +397,16 @@ tmux -L claude-ctl attach -t claude-ctl
 
 若一个常驻控制器**和**一个手动拉起的控制器同时连同一会话，会出现：两个进程都 tail 同一 JSONL（转写**重复下发**）、都往同一 PTY 写（输入**交错**）。故须**单实例约束**：
 
-- 启动时对 `${XDG_RUNTIME_DIR:-/tmp}/claude-pty-controller-<session>.lock` 做 `flock(LOCK_EX|LOCK_NB)`；拿不到锁 → 说明已有实例 → **直接退出**（让守护不致起重复实例），或按 flag 改为「抢占：发信号让旧实例 detach 后再接管」。
-- 锁的粒度 = 每个 tmux 会话名一把，未来多会话（非目标 v1）天然隔离。
-- 重连/重启的接管是幂等的：`new-session -A` 不会复制会话；WS 重连重新鉴权；JSONL 游标在进程内重建（重启后从 0 重扫一次或由 Dashboard `refresh:full` 重建，§3.2）。
+- 启动时对一个**命名空间稳定**的锁文件做 `flock(LOCK_EX|LOCK_NB)`；拿不到锁 → 已有实例 → **直接退出**（让守护不起重复实例），或按 flag 改为「抢占」。⚠️ **抢占需旧实例 PID** 而 §12.3 不写 pidfile——折中是把 PID 写进**锁文件正文**（锁本身保活性,正文仅供发信号）;否则 v1 只保留"丢锁即退",由 systemd 串行化。
+- ⚠️ **锁目录要避开 PrivateTmp（评审）**：系统服务常无 `XDG_RUNTIME_DIR`,回退 `/tmp`;若 systemd 开 `PrivateTmp=yes`,被托管实例与手动实例的 `/tmp` 在**不同 mount namespace**,互相看不见锁 → 单实例**静默失效**。锁应放 `RuntimeDirectory=`（`/run/<name>`,不受 PrivateTmp 影响）或显式配置目录,并在启动日志打印解析后的锁路径。
+- ⚠️ **此 flock ≠ §13 的 driver 锁（评审）**：flock 只防"第二个**控制器进程**启动"(host 层 OS 锁);§13 的"单 driver"是仲裁"同一控制器的 N 个 **dashboard** 谁能写"(进程内、按设备公钥的票据)。**两者只共享"单写"原则、不是同一机制**;别以为 ship 了 flock 就有了 driver 互斥。`<session>` 当前是常量(tmux 名硬编码 `claude-ctl`),"多会话天然隔离"不成立——要么参数化会话名并同步锁键,要么明示 v1 为单会话机器级单例。
+- 重连/重启的接管是幂等的：`new-session -A` 不复制会话；WS 重连重新鉴权；JSONL 游标在进程内重建（重启后从 0 重扫一次或由 Dashboard `refresh:full` 重建，§3.2）。
 
 > 注意：进程重启会丢失内存态游标，重启后首轮可能**重发**部分已发过的转写行。Dashboard 端按 `uuid` 幂等去重，或重启后等一条 `refresh:full` 重建——二选一。**前提**：去重依赖 `uuid`，而 `uuid` **只在消息行**存在（§3.2 实测，辅助行无）→ 转写通道**只转发带 uuid 的消息行**，否则辅助行无法去重、每次重启重复。
 
 ### 12.5 存活探测（可选，M5）
 
-systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd-notify` crate，无 C 依赖）发 `READY=1` 与周期 `WATCHDOG=1`。当事件循环卡死（如 PTY 读阻塞、死锁）超过 watchdog 周期未喂狗，systemd 判定僵死并重启 —— 比单纯「进程还在」更真实的存活信号。非 systemd 环境退化为无 watchdog。
+systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd-notify` crate）发 `READY=1` 与周期 `WATCHDOG=1`，事件循环僵死超时未喂狗即被重启。⚠️ **注意盲区（评审）**：§2 故意把 PTY 读/写放在 `spawn_blocking`/专用线程,**正是为了不让阻塞 I/O 拖住 tokio 运行时**;若由 tokio 定时器喂狗,则 PTY 读线程**永久阻塞时运行时仍健康、狗照喂、systemd 不触发**——恰恰测不到 §12.5 自称要测的"PTY 读阻塞"。要真测到,须让**每个关键阻塞线程各维护一个心跳(AtomicU64 时间戳)**,喂狗任务仅在所有线程近期有进展时才喂;否则把本节范围降为"仅测运行时级僵死"。非 systemd 环境退化为无 watchdog。
 
 ### 12.6 落盘物（实现阶段，本次仅设计）
 
@@ -434,9 +435,12 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 
 - **双向外连、NAT 友好**：两端都**主动拨出**到 relay，被控机**无需开入站端口**，天然穿透 NAT/防火墙。
 - **房间撮合**：relay 按 `room id`（rendezvous id，§14）把同一对 controller/dashboard 配进一个房间互转。一房间 1 controller + N dashboard。
-- **多控制端 / 谁能驱动**：N 个 dashboard 可同时**观看**；**驱动（写入）单写** —— 被控端只接受当前持锁 driver 的输入（复用 §12.4 单写思路），其余只读，避免输入交错。
-- **透明**：relay 只搬运**不透明密文帧**，不解析、不理解协议 —— §3/§4 的 JSON 消息原样跑在隧道里，换 relay 实现对两端透明。透明与加密**互为因果**：正因 payload 对 relay 不透明，relay 被迫只能当哑转发。
-- **直连特例**：若被控端公网可达，dashboard 可跳过 relay 直连其 `wss`（§5），relay 可选；E2EE 两模式都适用。
+- ⚠️ **扇出不是"转发同一密文帧"（评审 BLOCKER）**：E2EE 是**逐 dashboard 成对**的 Noise 会话（各自密钥），一份密文**无法被 N 个 dashboard 解密**。所以广播帧（通道一/二/三）必须在**被控端按每个 dashboard 各加密一次**（见 §14 扇出加密阶段），relay 只是把 per-dashboard 密文分发到对应连接——**不是 relay 复制一份不透明帧给所有人**。这与 §2 的"单 sink"只在**每连接**层面成立、不在全局成立。
+- **多控制端 / 谁能驱动**：N 个 dashboard 可同时**观看**；**驱动（写入）单写**。⚠️ 此"driver 锁"是被控端**进程内**、按 dashboard 的**静态公钥身份**（§14）授权的票据，**与 §12.4 的 flock 是两套机制**（后者只防第二个控制器进程启动，不仲裁 dashboard）。需定义 acquire / 让渡 / 超时 / 断开清理;非 driver 的 `input` 帧静默丢弃 + 回事件。本地 `tmux attach` 的击键绕过此锁（§2.1），严格单写须给本地 attach 用 `attach -r`。
+- **透明**：relay 只搬运**不透明密文帧**，不解析协议；透明与加密**互为因果**。⚠️ 但"只看密文"≠"房间抗滥用"：`room id` 由知道 `rendezvous_secret` 者可算出（§14），**被吊销/曾配对的 dashboard 仍能算出 room id**并占 slot / 刷连接 / DoS。故经 relay 时 **`RELAY_TOKEN` 应为必需**（非可选）+ 每 IP/每 token 连接与速率限制 + 明确"谁是权威 controller slot"（凭绑定控制器密钥的证明,而非仅 room id）。
+- ⚠️ **relay 非"无状态可水平扩展"（评审）**：房间撮合要求 controller 与其 N dashboard **落到同一 relay 实例**并共享 room→连接映射 —— 这是**每实例软状态**。多实例需 **按 room id 粘性路由** 或共享撮合注册表（如 Redis）；否则两端撞不上。relay 重启丢全部 room → 两端须检测断连并重新 rendezvous。
+- ⚠️ **relay 背压不能复用 §7（评审）**：§7 是**被控端本地**策略且依赖**读帧类型**做"丢旧"，而 relay 只见密文、读不出通道类型。relay 须用**每连接有界队列**：单个慢 dashboard 被丢/断,**不得 head-of-line 阻塞**整个房间;通道感知的丢旧只能在被控端的 per-dashboard 加密阶段做。
+- **直连特例**：若被控端公网可达，dashboard 可跳过 relay 直连其 `wss`。⚠️ 直连的鉴权模型须与 §14 对齐：要么直连也跑 `Noise_IK` + 授权表校验（保留每设备吊销/FS），要么明示直连退化为 §5 的共享 `CONTROL_TOKEN`（**失去**每设备吊销与前向保密）—— 二者不可含糊。
 
 ## 14. 传输与端到端加密（中间流量对 Relay 不可见）
 
@@ -448,10 +452,13 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 
 - **身份密钥（v1 基线）**：被控端持一对**长期静态密钥**（X25519，Noise 身份），其公钥 = 服务器身份；**每个控制端设备各持自己的静态密钥对**。被控端维护一张**授权设备表** `authorized_devices`（`{label, pubkey, added_at}` 列表）。
 - **首次入网（enrollment，一次性）**：新设备用 `PAIRING_SECRET` 作 PSK 跑一次 `Noise_XXpsk3` 握手（经 relay 转发）—— 双方**交换并 pin 对方静态公钥**，被控端把新设备公钥写入授权表（带 label）。`PAIRING_SECRET` **仅用于入网**、可一次性 / 限时 / 入网后轮换，**不参与日常会话**。
+- 🔴 **`PAIRING_SECRET` 必须高熵（评审 BLOCKER）**：`Noise+PSK` **不是 PAKE**——XXpsk3 把 PSK 当对称密钥混入,**主动型 relay**（本设计明确假定 relay 敌对且在握手路径上）可拿握手记录对**弱/手输** PSK 做**离线字典攻击**,猜中后冒充被控端入网一个流氓设备 = E2EE 被绕过。故 **`PAIRING_SECRET` 须 ≥128 位高熵、由扫码/复制传递,禁止人手短码**（与 §9 的 `openssl rand -hex 32` 同级）。若必须支持人手短码,改用真正的 **PAKE（CPace/SPAKE2,需额外依赖,snow 不提供）** 把离线猜解降级为每次一猜的在线猜解。
 - **稳态连接（每次连接）**：用已 pin 的静态密钥跑 `Noise_IK`（dashboard 知被控端公钥、作发起方；被控端在握手内收到 dashboard 静态公钥）—— 被控端**校验该公钥 ∈ 授权表**，否则拒绝握手。产出**每会话对称密钥 + 前向保密**（临时 DH），日常连接**不再需要 `PAIRING_SECRET`**。重连即重握手换新 FS 密钥。
-- **吊销（v1）**：从授权表删除某设备公钥即吊销 → 其后续握手一律失败；被控端在授权表变更时**主动断开**该公钥的在用会话（授权表热加载：信号 / 文件监视）。前向保密保证其**历史流量仍不可解**。
-- **数据帧**：§3/§4 每条 JSON 消息 → 序列化 → Noise transport（AEAD = ChaCha20-Poly1305）加密 → 定长前缀分帧 → **二进制不透明帧**交 relay；控制端解密还原。AEAD 自带完整性 / 抗篡改；Noise 计数器 + 序列号抗重放 / 乱序。
-- **房间寻址不泄密**：`room id = HMAC(rendezvous_secret, "rendezvous" || epoch)` 截断（`rendezvous_secret` 由被控端静态公钥 / 入网密钥**带外派生**、dashboard 已知）—— 两端各自算同值、relay 据此撮合，但它**不可猜、随 epoch 轮换、无法长期关联会话**，也算不出任何密钥。
+- **吊销（v1）**：从授权表删除某设备公钥即吊销 → 其后续握手一律失败；被控端在授权表变更时**主动断开**该公钥的在用会话（授权表热加载：信号 / 文件监视）。前向保密保证其**历史流量仍不可解**。⚠️ **非瞬时（评审）**：授权只在**握手时**校验,吊销前已建的 `Noise_IK` 会话会跑到异步断开生效为止,且 out_tx 里在途帧仍可能送达——"即刻失联"是目标、非保证。要真瞬时须**每帧/每 epoch 重查授权**;否则文档须承认这个最终一致窗口。
+- **扇出加密（成对，评审 BLOCKER）**：广播输出（通道一/二/三）在被控端**按每个已连 dashboard 的 Noise 会话各加密一次** → out_rx 后接一个 dispatcher，把每条明文帧克隆给 per-dashboard 加密任务（各持一份 Noise transport + 一个 sink）。**N 个 dashboard = N 次 AEAD + N 路 sink**（CPU/带宽随 N 线性,§7 背压须按此计）。这也意味着**吊销/前向保密只在成对模型下良定义**;不要引入共享群密钥（否则吊销须全员 rekey）。
+- **数据帧**：每条规范 JSON 消息（§16.3） → 序列化 → Noise transport（AEAD = ChaCha20-Poly1305）加密 → 定长前缀分帧 → **二进制不透明帧**交 relay；控制端解密还原。AEAD 自带完整性 / 抗篡改；Noise 计数器抗**同会话内**重放 / 乱序。⚠️ **跨重连重放（评审）**：重连即重握手、nonce 计数器归零,relay 可在会话边界重放旧密文,或在传输层重放/withhold 帧。`uuid` 去重只护**通道二输出**;**入站 `input` 帧无 uuid**,被重放会**重复执行命令** → 入站帧须带**应用层单调序号 + 会话绑定 nonce**,跨重连拒重复。
+- **房间寻址不泄密**：`room id = HMAC(rendezvous_secret, "rendezvous" || epoch)` 截断。⚠️ **须钉死(评审)**：(1) `rendezvous_secret` 是**入网时分发的专用高熵秘密**,**不是**被控端静态**公钥**（公钥非秘密 → relay 能重算 room id 长期关联/追踪；且若源自入网密钥则任一曾配对设备可算未来所有 room id）;其生命周期**与 `PAIRING_SECRET` 解耦**,后者轮换不得改变稳态 room id。(2) `epoch` 须定义粒度与时钟模型,例 `floor(unixtime/W)`（W 为窗口）,两端各**监听/试 {epoch-1, epoch, epoch+1}** 容时钟偏移,否则轮换边界会撞空房间静默失败。(3) epoch 轮换**只影响新 rendezvous,不拆已建会话**。
+- ⚠️ **身份隐藏/KCI 限定（评审）**：`Noise_IK` 对**被动** relay 隐藏静态公钥,但对**主动** relay 仅弱响应方身份隐藏（可探测/确认猜测的被控端公钥）;且 IK 有 **KCI**——被控端静态私钥泄露 → 可冒充**任意** dashboard 向被控端**注入输入(= RCE,§5)**。故被控端私钥须 OS keystore / `mlock` + `0600`,并给轮换指引。「relay 看不到任何静态公钥」仅对被动观测成立。
 - **Relay 看得到 / 看不到**：看得到 = `room id`、帧大小、时序、两端 IP；看不到 = 任何明文内容、**任何静态公钥**（入网时公钥也在加密握手内传输）。元数据加固（可选）：长度分桶填充、心跳整形；默认不做、文档标注此泄露面。
 - **Relay 鉴权（防滥用，正交于 E2EE）**：可选 `RELAY_TOKEN` 限制谁能用中转服务（DoS / 配额）。即便冒充者混进房间，静态公钥不在授权表 / 无入网 PSK，也过不了握手、读不到任何东西。
 
@@ -474,14 +481,14 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 - **通道二**：JSONL tail + 会话切换识别 + **后台 agents 多会话发现**（`claude agents --json`、`%USERPROFILE%\.claude\` 下的 `sessions\*.json` / `daemon\roster.json`）—— 纯文件 / CLI，天然跨平台（§3.2 / §3.5）。"一终端多 session" 在 Windows 上**不依赖 tmux**（后台 agent 本就无头）。
 - **通道三**：OSC 状态机是字节级的（§3.3），可移植。
 - 输入注入、WebSocket、背压、单实例锁（Windows 用具名互斥量 / 文件锁）。
-- **PTY**：`portable-pty` 在 Windows 走 **ConPTY**（Win10 1809+）；单 `.exe` 交叉编译 `x86_64-pc-windows-msvc`。
+- **PTY**：`portable-pty` 在 Windows 走 **ConPTY**（Win10 1809+；实测 0.8.1 的 ConPTY 支持 `resize()` 与 `try_clone_reader()`）。⚠️ **交叉编译不是一行**（评审）：rustls 的活动后端 `ring` 要编译 C/汇编,`x86_64-pc-windows-msvc` 目标还需 **MSVC SDK + 链接器**,从 Linux 不能裸交叉——须在 Windows/CI 上构建,或改用 `*-windows-gnu`(MinGW) / xwin 拉 SDK。
 
 **唯一缺口 = tmux 的"会话宿主"职责**（持久留存 + 本地双向 attach + 多客户端镜像，§2.1）。Windows 无 tmux，两条路线：
 
 - **路线 A · WSL2（推荐，v1 即可用）**：在 WSL2 里跑被控端 → **完整 Unix/tmux 模型原样适用、零改动**，覆盖多数 Windows 开发者。v1 的 Windows 支持 = "在 WSL2 中运行"。
 - **路线 B · 原生 ConPTY + 自建会话宿主（v2/v3）**：把 tmux 那层抽象成 `SessionHost` trait，双实现：
   - `TmuxHost`（Unix / WSL）= 现状。
-  - `ConPtyHost`（原生 Windows）= 一个**独立长存的会话宿主进程**（Windows 服务 / 分离进程）持有 ConPTY + claude；控制器经**命名管道** attach。关键：ConPTY 由创建进程拥有、进程退则 claude 亡 —— 故**持久留存必须靠这个独立宿主进程**，控制器重启后经命名管道重接管；本地"双向透明" = 第二个命名管道客户端镜像 I/O（自实现 tmux 的多客户端角色）。
+  - `ConPtyHost`（原生 Windows）= 一个**独立长存的会话宿主进程**（Windows 服务 / 分离进程）持有 ConPTY + claude；控制器经**命名管道** attach。关键：ConPTY 由创建进程拥有、进程退则 claude 亡 —— 故**持久留存必须靠这个独立宿主进程**，控制器重启后经命名管道重接管。⚠️ **"自实现 tmux 多客户端"被严重低估(评审)**：这等于做一个 mini-tmux —— 要解决 ① 一路 ConPTY 输出扇出给 N 个管道客户端(独立游标+背压)、② 多客户端**输入仲裁**(无 tmux 的 `attach -r` 可借)、③ **resize 仲裁**(ConPTY 单几何,同 §2.1 的"谁赢")、④ 崩溃后重 attach 握手与客户端存活检测、⑤ host↔控制器线协议。§2.1 为 tmux 版写了 ~25 行,这条更难却只两句。明确列为 v2/v3 非平凡工作项。
 
 **平台差异表**：
 
@@ -490,8 +497,8 @@ systemd `Type=notify` + `WatchdogSec=`：控制器用 `sd_notify`（纯 Rust `sd
 | 会话宿主 / 持久 | tmux `new-session -A` | 独立 `ConPtyHost` 进程 + 命名管道 attach |
 | 本地双向 | `tmux attach` 多客户端 | 第二个命名管道客户端 |
 | resize | `master.resize()` | ConPTY resize（同 API） |
-| 标题信号 | claude 发 **OSC 0** | claude 用 **`SetConsoleTitle`（`process.title`），非 OSC** → §3.2.1 的"标题切换提示"在原生 Windows 失效，退回**按行 `sessionId`**（仍是唯一真值，不影响识别） |
-| tab_status | OSC 21337（tmux DCS 包裹） | OSC 21337（无 tmux，**裸 OSC，更简单**） |
+| 标题信号 | claude 发 **OSC 0**（`SET_TITLE_AND_ICON`，实测） | **待 Windows 构建复核**：claude 在 Linux 二进制里始终用 OSC 0（无 `SetConsoleTitle`/`kernel32`）;`process.title` 只设**进程名**、非控制台标题,二者不可等同。若 Windows 经典控制台/ConPTY 吞掉 OSC 0 则标题信号失效 → 退回**按行 `sessionId`**（不影响识别） |
+| 屏幕 / tab_status | OSC 21337（tmux DCS 包裹）；status off 消噪 | OSC 21337 裸发,但 ⚠️ **ConPTY 重绘会刷屏(评审)**:ConPTY 整屏重 paint 会**重复/灌满通道一**(无 tmux `status off` 类开关),且实测 claude 自身在 "Windows over SSH (ConPTY re-rendering)" 下**主动关全屏**。需 vt100 屏幕 diff 去重 / `CLAUDE_CODE_NO_FLICKER=1`。**不比 tmux"更简单"** |
 | 信号 | SIGHUP/TERM/WINCH | 控制台控制事件 / Job Object；`ctrlc` |
 | 常驻（§12） | systemd | **Windows 服务**（或任务计划 / NSSM），自愈链同构 |
 | 配置路径 | `~/.claude` | `%USERPROFILE%\.claude`（`dirs` crate 处理） |
