@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
     };
     let _ = out_tx.send(hello.to_json()).await;
 
-    // WebSocket task.
-    tokio::spawn(ws::run(cfg.remote_url.clone(), out_rx, in_tx, cancel.clone()));
+    // WebSocket task (wss + Bearer auth, §5).
+    tokio::spawn(ws::run(cfg.remote_url.clone(), cfg.control_token.clone(), out_rx, in_tx, cancel.clone()));
 
     // Channel-2 transcript watcher (poll + event-triggered + manual refresh, §3.2).
     {

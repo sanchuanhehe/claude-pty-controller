@@ -27,6 +27,15 @@ impl Config {
             .unwrap_or_else(|| vec!["claude".into()]);
 
         let is_loopback = remote_url.contains("127.0.0.1") || remote_url.contains("localhost") || remote_url.contains("[::1]");
+        let is_wss = remote_url.starts_with("wss://");
+        let is_ws = remote_url.starts_with("ws://");
+        if !is_wss && !is_ws {
+            bail!("REMOTE_URL must be ws:// or wss:// (got {remote_url})");
+        }
+        // §5: production requires wss; plaintext ws:// only on loopback + insecure.
+        if is_ws && !(insecure && is_loopback) {
+            bail!("plaintext ws:// is only allowed on loopback with CPC_INSECURE=1; use wss:// in production. See docs/ARCHITECTURE.md §5.");
+        }
         // §5: refuse to start without a token unless explicitly insecure on loopback.
         if control_token.is_none() && !(insecure && is_loopback) {
             bail!("CONTROL_TOKEN is required (set it, or use CPC_INSECURE=1 on a loopback REMOTE_URL). See docs/ARCHITECTURE.md §5.");
