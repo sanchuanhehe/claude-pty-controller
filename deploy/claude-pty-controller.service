@@ -1,0 +1,33 @@
+[Unit]
+Description=claude-pty-controller (remote control for agent TUIs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Watchdog: the controller sends WATCHDOG=1 at half this interval; a runtime
+# stall (or a gated stale component) misses it and systemd restarts us (§12.5).
+WatchdogSec=30
+
+User=claude
+ExecStart=/opt/claude-pty-controller
+EnvironmentFile=/etc/claude-pty-controller.env
+
+# Self-heal: on crash/watchdog-timeout, restart; the controller re-attaches the
+# still-alive tmux session via `new-session -A` (§12.2).
+Restart=always
+RestartSec=2
+
+# Single-instance lock lives here — RUNTIME_DIRECTORY is namespace-stable, so do
+# NOT enable PrivateTmp (it would defeat the lock across instances; OPS-5).
+RuntimeDirectory=claude-pty-controller
+# Controller state (static key + authorized_devices) — point CLAUDE_PTY_HOME here.
+StateDirectory=claude-pty-controller
+
+# Hardening (tune per deployment — claude itself writes ~/.claude, so blanket
+# ProtectHome=yes will break it; grant the needed paths instead).
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

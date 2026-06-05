@@ -19,6 +19,7 @@ use claude_pty_controller::proto::{Capabilities, Incoming, Outgoing, RefreshScop
 use claude_pty_controller::pty::tmux::{TmuxConfig, TmuxHost};
 use claude_pty_controller::session::TranscriptWatcher;
 use claude_pty_controller::singleton::InstanceLock;
+use claude_pty_controller::watchdog::{self, Gate, Heartbeat};
 use claude_pty_controller::ws;
 
 #[tokio::main]
@@ -128,11 +129,13 @@ async fn main() -> Result<()> {
     // PTY reader (blocking) → channel 1 (output) + channel 3 (osc).
     // A tab_status turn-end transition (Working → Idle/Waiting) also pokes
     // refresh_tx so channel-2 catches up immediately (§3.2 source #2).
+    let reader_hb = Heartbeat::new();
     {
         let hi_tx = hi_tx.clone();
         let lo_tx = lo_tx.clone();
         let cancel = cancel.clone();
         let refresh_tx = refresh_tx.clone();
+        let reader_hb = reader_hb.clone();
         tokio::task::spawn_blocking(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
@@ -143,6 +146,7 @@ async fn main() -> Result<()> {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        reader_hb.beat(); // liveness for the watchdog (§12.5)
                         let chunk = &buf[..n];
                         let text = utf8.push(chunk);
                         if !text.is_empty() {
@@ -173,6 +177,20 @@ async fn main() -> Result<()> {
             cancel.cancel();
         });
     }
+
+    // systemd watchdog (§12.5). READY=1, then gated periodic WATCHDOG=1.
+    // Reader-staleness gating is opt-in (idle reader is healthy); without it the
+    // watchdog still detects runtime-level stalls (this task stops feeding).
+    watchdog::notify_ready();
+    let mut gates = Vec::new();
+    if let Ok(secs) = std::env::var("CPC_WATCHDOG_READER_STALL_SECS") {
+        if let Ok(secs) = secs.parse::<u64>() {
+            if secs > 0 {
+                gates.push(Gate { name: "pty_reader".into(), hb: reader_hb, max_stale_ms: secs * 1000 });
+            }
+        }
+    }
+    let _watchdog = watchdog::spawn(cancel.clone(), gates);
 
     // pty_writer / inbound loop (single writer, §2).
     loop {
