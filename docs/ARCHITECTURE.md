@@ -195,6 +195,16 @@ struct EventMsg {
 
 线缆示例：`{"type":"event","event":"tab_status","status":"Working…","indicator":"#ff9500"}`。
 
+## 3.4 模式无关性与优雅降级（含 `claude agents` / 全屏 UI）
+
+claude 在 pane 里会进入各种非常规对话状态：`/agents`（REPL 内的 Ink 代理管理 UI）、`/resume` 选择器、plan 模式、以及 **`claude agents`**（核对源码，这是个 CLI 子命令：列出已配置 agents 后**直接 `exit(0)`**，**不开会话、不写 JSONL、不发 OSC**）。设计原则：
+
+- **通道一（屏幕）模式无关、永远可用**：tmux 镜像的是 pane 的最终 ANSI 画面 —— 无论 claude 渲染的是对话、全屏 alt-buffer UI、还是列表输出，远程 Dashboard + 本地 attach 都**透明可见可驱动**。`claude agents` / `/agents` 这类模式**仅靠通道一即可完整远程操作**。
+- **通道二/三 best-effort、优雅降级**：这些模式不产生转写、不发状态 OSC 时，通道二自然**安静**、通道三仅余 idle 跃迁 —— 这是**预期降级，不是故障**：没转写就不发 transcript，没 OSC 就不发 event，通道一照常。控制器不得因通道二/三无数据而误判会话异常。
+- **回到对话由 §3.2.1 兜底**：从 `/agents` 选中并运行某 agent → 进入正常会话（同一 `<sessionId>.jsonl`，通道二恢复）或派生子代理；会话切换/恢复一律由按行 `sessionId` 重锁覆盖。
+
+> **子代理（Task fan-out / swarm）**：其内部对话写在独立 sidechain `…/<sessionId>/subagents/agent-<agentId>.jsonl`，主转写只含 `Task` 的 tool_use + 最终 tool_result（即"看得到 agent 的输入与最终产出，看不到内部步骤"）。v1 通道二**仅 tail 主文件**；**多文件嵌套 tail 子代理对话**列为 v2（§11 M5）—— 届时并发 tail 各 sidechain（每文件独立换行游标），按 `agentId` / `isSidechain` / `parentUuid` 还原嵌套树，并按主转写里 `Task` tool_use.id ↔ `agent-<id>` 关联归属。远程 agents（CCR）只有 `remote-agents/*.meta.json`，转写在云端、本地不可 tail。
+
 ## 4. 入站协议（远程 → PTY）
 
 ```json
