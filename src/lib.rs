@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod channels;
 pub mod config;
+pub mod e2ee;
 pub mod proto;
 pub mod pty;
 pub mod session;

@@ -19,6 +19,11 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# E2EE (§14): Noise XXpsk3 + X25519/ChaChaPoly/SHA256, room-id HMAC.
+snow = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 # Optional (see docs/ARCHITECTURE.md):
 # notify = "6"      # JSONL inotify instead of polling
