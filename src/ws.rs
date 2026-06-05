@@ -26,10 +26,14 @@ fn build_request(url: &str, token: Option<&str>) -> anyhow::Result<tokio_tungste
     Ok(req)
 }
 
+/// Outbound queues (channel-aware backpressure, §7 / review RELAY-5):
+/// - `hi`: reliable messages (transcript/event/session/hello/notify) — drained first.
+/// - `lo`: terminal output (channel 1) — droppable on full (reconstructible screen).
 pub async fn run(
     url: String,
     token: Option<String>,
-    mut out_rx: mpsc::Receiver<String>,
+    mut hi_rx: mpsc::Receiver<String>,
+    mut lo_rx: mpsc::Receiver<String>,
     in_tx: mpsc::Sender<Incoming>,
     cancel: CancellationToken,
 ) {
@@ -59,14 +63,15 @@ pub async fn run(
                 }
                 loop {
                     tokio::select! {
+                        biased;
                         _ = cancel.cancelled() => return,
-                        outbound = out_rx.recv() => match outbound {
-                            Some(text) => {
-                                if sink.send(Message::Text(text)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => return, // producers gone
+                        hi = hi_rx.recv() => match hi {
+                            Some(text) => if sink.send(Message::Text(text)).await.is_err() { break },
+                            None => return,
+                        },
+                        lo = lo_rx.recv() => match lo {
+                            Some(text) => if sink.send(Message::Text(text)).await.is_err() { break },
+                            None => return,
                         },
                         inbound = stream.next() => match inbound {
                             Some(Ok(Message::Text(t))) => {
@@ -89,12 +94,23 @@ pub async fn run(
                 tracing::warn!(error = %e, "websocket connect failed");
             }
         }
+        let delay = jitter(backoff_ms);
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
         }
         backoff_ms = (backoff_ms * 2).min(15_000);
     }
+}
+
+/// ±25% jitter to avoid reconnect thundering-herds (review RELAY-7).
+fn jitter(ms: u64) -> u64 {
+    let delta = (ms / 4).max(1);
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    ms.saturating_sub(delta) + (n % (2 * delta + 1))
 }
 
 #[cfg(test)]

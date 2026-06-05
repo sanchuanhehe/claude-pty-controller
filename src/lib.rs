@@ -7,4 +7,5 @@ pub mod config;
 pub mod proto;
 pub mod pty;
 pub mod session;
+pub mod singleton;
 pub mod ws;

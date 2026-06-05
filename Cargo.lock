@@ -73,6 +73,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "futures-util",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

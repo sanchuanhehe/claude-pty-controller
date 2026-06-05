@@ -18,6 +18,7 @@ use claude_pty_controller::config::Config;
 use claude_pty_controller::proto::{Capabilities, Incoming, Outgoing, RefreshScope, State, PROTO_V};
 use claude_pty_controller::pty::tmux::{TmuxConfig, TmuxHost};
 use claude_pty_controller::session::TranscriptWatcher;
+use claude_pty_controller::singleton::InstanceLock;
 use claude_pty_controller::ws;
 
 #[tokio::main]
@@ -29,7 +30,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    tracing::info!(remote = %cfg.remote_url, agent = ?cfg.agent_cmd, "starting claude-pty-controller (M1)");
+    tracing::info!(remote = %cfg.remote_url, agent = ?cfg.agent_cmd, "starting claude-pty-controller");
+
+    // Single-instance lock (§12.4) — refuse a second controller for this session.
+    let _lock = InstanceLock::acquire(&cfg.tmux_session)?;
+    tracing::info!(lock = %_lock.path().display(), "instance lock acquired");
 
     let cancel = CancellationToken::new();
 
@@ -53,27 +58,28 @@ async fn main() -> Result<()> {
         rows: cfg.rows,
     })?;
 
-    // Channels (bounded — §7 backpressure).
-    let (out_tx, out_rx) = mpsc::channel::<String>(1024);
+    // Channel-aware backpressure (§7): hi = reliable, lo = droppable output.
+    let (hi_tx, hi_rx) = mpsc::channel::<String>(1024);
+    let (lo_tx, lo_rx) = mpsc::channel::<String>(256);
     let (in_tx, mut in_rx) = mpsc::channel::<Incoming>(256);
     // Channel-2 refresh signals: `true` = full re-send (§3.2 three sources).
     let (refresh_tx, mut refresh_rx) = mpsc::channel::<bool>(64);
 
-    // Hello (§16.3 ADP-4).
+    // Hello (§16.3 ADP-4) — reliable.
     let hello = Outgoing::Hello {
         v: PROTO_V,
         agent: AGENT_ID.into(),
         capabilities: Capabilities { transcript: true, status: true, multi_session: false, input: true },
     };
-    let _ = out_tx.send(hello.to_json()).await;
+    let _ = hi_tx.send(hello.to_json()).await;
 
     // WebSocket task (wss + Bearer auth, §5).
-    tokio::spawn(ws::run(cfg.remote_url.clone(), cfg.control_token.clone(), out_rx, in_tx, cancel.clone()));
+    tokio::spawn(ws::run(cfg.remote_url.clone(), cfg.control_token.clone(), hi_rx, lo_rx, in_tx, cancel.clone()));
 
     // Channel-2 transcript watcher (poll + event-triggered + manual refresh, §3.2).
     {
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        let out_tx = out_tx.clone();
+        let hi_tx = hi_tx.clone();
         let cancel = cancel.clone();
         match project_dir_for(&cwd, None) {
             Some(project_dir) => {
@@ -87,7 +93,10 @@ async fn main() -> Result<()> {
                             sig = refresh_rx.recv() => match sig { Some(f) => f, None => break },
                         };
                         for msg in watcher.poll(full) {
-                            let _ = out_tx.try_send(msg.to_json());
+                            // reliable → backpressure rather than drop.
+                            if hi_tx.send(msg.to_json()).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 });
@@ -100,7 +109,8 @@ async fn main() -> Result<()> {
     // A tab_status turn-end transition (Working → Idle/Waiting) also pokes
     // refresh_tx so channel-2 catches up immediately (§3.2 source #2).
     {
-        let out_tx = out_tx.clone();
+        let hi_tx = hi_tx.clone();
+        let lo_tx = lo_tx.clone();
         let cancel = cancel.clone();
         let refresh_tx = refresh_tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -116,8 +126,8 @@ async fn main() -> Result<()> {
                         let chunk = &buf[..n];
                         let text = utf8.push(chunk);
                         if !text.is_empty() {
-                            // drop on full rather than stall the PTY reader (§7).
-                            let _ = out_tx.try_send(Outgoing::output(None, text).to_json());
+                            // channel 1: droppable — drop on full, never stall the reader (§7).
+                            let _ = lo_tx.try_send(Outgoing::output(None, text).to_json());
                         }
                         for ev in osc.feed(chunk) {
                             if let OscEvent::TabStatus { status: Some(s), .. } = &ev {
@@ -131,7 +141,8 @@ async fn main() -> Result<()> {
                                 }
                             }
                             if let Some(msg) = claude::osc_to_outgoing(&ev, None) {
-                                let _ = out_tx.try_send(msg.to_json());
+                                // channel 3: reliable.
+                                let _ = hi_tx.try_send(msg.to_json());
                             }
                         }
                     }
@@ -162,9 +173,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown: detach (keep session + claude alive, §8).
+    // Graceful shutdown: disambiguate detach vs external kill (§8, review finding).
     if host.session_alive() {
         host.detach();
+        tracing::info!("detached; tmux session persists (claude keeps running)");
+    } else {
+        tracing::info!("tmux session gone (killed externally); exiting without recreate");
     }
     tracing::info!("shutdown");
     Ok(())
