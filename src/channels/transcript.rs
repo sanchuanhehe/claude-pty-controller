@@ -51,6 +51,54 @@ fn radix36(mut n: u64) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// `<base>/projects/<sanitized-cwd>` for a given cwd. `base` defaults to
+/// `$CLAUDE_CONFIG_DIR ?? ~/.claude`.
+pub fn project_dir_for(cwd: &str, base: Option<&Path>) -> Option<PathBuf> {
+    let base: PathBuf = match base {
+        Some(b) => b.to_path_buf(),
+        None => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => dirs::home_dir()?.join(".claude"),
+        },
+    };
+    Some(base.join("projects").join(sanitize_cwd(cwd)))
+}
+
+/// True if `stem` looks like a session UUID (8-4-4-4-12 hex) — used to pick the
+/// main transcript file and skip non-session `*.jsonl`.
+pub fn is_uuid_stem(stem: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = stem.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip(groups).all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Find the most-recently-modified top-level `<uuid>.jsonl` in `project_dir`.
+/// (Single-pane discovery: at any instant one session is being written; §3.2.1.
+/// Multi-session must instead attribute by sessionId → exact path, §3.5 MS-6.)
+pub fn find_active_jsonl(project_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in fs::read_dir(project_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if is_uuid_stem(s) => s,
+            _ => continue,
+        };
+        let _ = stem;
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if best.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+            best = Some((path, mtime));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
 /// Extract the line's session id, if present. Returns `None` for line types that
 /// carry no sessionId (e.g. `file-history-snapshot`) — callers must SKIP these for
 /// switch detection, never treat absence as a new session (§3.2.1).

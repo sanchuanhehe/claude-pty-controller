@@ -4,8 +4,64 @@
 
 use crate::channels::osc::OscEvent;
 use crate::proto::{Outgoing, State, PROTO_V};
+use serde_json::{json, Value};
 
 pub const AGENT_ID: &str = "claude";
+
+/// Parse one Claude JSONL row into a normalized `transcript` message (§16.3).
+/// Returns `None` for rows we don't forward: those without a `uuid` (auxiliary
+/// line types — see §3.2; keeps dashboard dedup-by-uuid sound) or without a
+/// message body. Content blocks (text / thinking / tool_use / tool_result) map
+/// to normalized `parts`; the original row is kept in `raw` for fidelity.
+pub fn parse_transcript_line(v: &Value) -> Option<Outgoing> {
+    let uuid = v.get("uuid").and_then(Value::as_str)?;
+    let session = v.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+    let message = v.get("message")?;
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("type").and_then(Value::as_str))
+        .unwrap_or("assistant")
+        .to_string();
+
+    let parts = match message.get("content") {
+        Some(Value::String(s)) => vec![json!({"kind": "text", "text": s})],
+        Some(Value::Array(blocks)) => blocks.iter().filter_map(block_to_part).collect(),
+        _ => return None,
+    };
+
+    Some(Outgoing::Transcript {
+        v: PROTO_V,
+        agent: AGENT_ID.into(),
+        session,
+        role,
+        parts: Value::Array(parts),
+        msg_uuid: uuid.to_string(),
+        part_index: 0,
+        raw: Some(v.clone()),
+    })
+}
+
+fn block_to_part(block: &Value) -> Option<Value> {
+    match block.get("type").and_then(Value::as_str)? {
+        "text" => Some(json!({"kind": "text", "text": block.get("text").cloned().unwrap_or_default()})),
+        // Claude stores reasoning under the `thinking` key (§16.3 ADP-2).
+        "thinking" => Some(json!({"kind": "thinking", "text": block.get("thinking").cloned().unwrap_or_default()})),
+        "tool_use" => Some(json!({
+            "kind": "tool_use",
+            "id": block.get("id").cloned().unwrap_or_default(),
+            "name": block.get("name").cloned().unwrap_or_default(),
+            "input": block.get("input").cloned().unwrap_or(Value::Null),
+        })),
+        // content may be a string or an array of blocks (incl. images) — pass through (ADP-3).
+        "tool_result" => Some(json!({
+            "kind": "tool_result",
+            "forId": block.get("tool_use_id").cloned().unwrap_or_default(),
+            "content": block.get("content").cloned().unwrap_or(Value::Null),
+        })),
+        _ => None, // unknown block kinds survive in `raw`
+    }
+}
 
 /// Map a claude tab_status string to a normalized state. Matched by PREFIX, not
 /// exact literal, so the `Working…` ellipsis (U+2026) and minor version drift
@@ -71,5 +127,39 @@ mod tests {
     fn bell_maps_to_notify_not_state() {
         let m = osc_to_outgoing(&OscEvent::Bell, Some("s")).unwrap();
         assert!(matches!(m, Outgoing::Notify { .. }));
+    }
+
+    #[test]
+    fn parse_assistant_row_with_thinking_and_tool_use() {
+        let line: Value = serde_json::from_str(
+            r#"{"type":"assistant","uuid":"u1","sessionId":"s1","message":{"role":"assistant","content":[
+                {"type":"thinking","thinking":"hmm"},
+                {"type":"text","text":"ok"},
+                {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}
+            ]}}"#,
+        )
+        .unwrap();
+        let m = parse_transcript_line(&line).unwrap();
+        match m {
+            Outgoing::Transcript { session, role, parts, msg_uuid, .. } => {
+                assert_eq!(session, "s1");
+                assert_eq!(role, "assistant");
+                assert_eq!(msg_uuid, "u1");
+                let arr = parts.as_array().unwrap();
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0]["kind"], "thinking");
+                assert_eq!(arr[0]["text"], "hmm");
+                assert_eq!(arr[2]["kind"], "tool_use");
+                assert_eq!(arr[2]["name"], "Bash");
+            }
+            _ => panic!("expected transcript"),
+        }
+    }
+
+    #[test]
+    fn auxiliary_line_without_uuid_is_skipped() {
+        let line: Value =
+            serde_json::from_str(r#"{"type":"file-history-snapshot","snapshot":{}}"#).unwrap();
+        assert!(parse_transcript_line(&line).is_none());
     }
 }

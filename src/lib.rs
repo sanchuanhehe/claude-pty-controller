@@ -6,4 +6,5 @@ pub mod channels;
 pub mod config;
 pub mod proto;
 pub mod pty;
+pub mod session;
 pub mod ws;
