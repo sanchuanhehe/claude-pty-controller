@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>claude-pty-controller — dashboard</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px; background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
+  header input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 8px; }
+  header input#pairing { width: 280px; }
+  button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover { background: #30363d; }
+  #chip { margin-left: auto; padding: 4px 10px; border-radius: 999px; font-weight: 600; background: #30363d; }
+  #chip.idle { background: #1f6f3f; } #chip.working { background: #9e6a03; } #chip.waiting { background: #1f4f8f; } #chip.off { background: #6e2530; }
+  main { display: grid; grid-template-columns: 1fr 420px; height: calc(100vh - 90px); }
+  #term { padding: 6px; overflow: hidden; }
+  #transcript { border-left: 1px solid #30363d; overflow-y: auto; padding: 8px; }
+  .msg { margin: 6px 0; padding: 6px 8px; border-radius: 6px; background: #161b22; }
+  .msg .role { font-size: 11px; text-transform: uppercase; opacity: .6; }
+  .msg.user { border-left: 3px solid #388bfd; } .msg.assistant { border-left: 3px solid #3fb950; }
+  .thinking { opacity: .6; font-style: italic; } .tool { color: #d29922; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+  footer { display: flex; gap: 8px; padding: 8px; background: #161b22; border-top: 1px solid #30363d; }
+  footer input { flex: 1; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <input id="url" value="ws://127.0.0.1:9000" size="22" title="Relay URL" />
+  <input id="pairing" placeholder="PAIRING_SECRET (>=32 chars)" />
+  <input id="token" placeholder="RELAY_TOKEN" size="14" />
+  <button id="connect">Connect</button>
+  <button id="refresh" title="Reload transcript">↻ history</button>
+  <span id="chip" class="off">offline</span>
+</header>
+<main>
+  <div id="term"></div>
+  <div id="transcript"></div>
+</main>
+<footer>
+  <input id="input" placeholder="Type and Enter to send to the agent…" />
+  <button id="ctrlc" title="Ctrl-C">^C</button>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script type="module">
+import { Initiator, genKeypair, derivePsk, roomIdNow } from './noise-web.mjs';
+
+const $ = (id) => document.getElementById(id);
+const b64 = (u) => btoa(String.fromCharCode(...u));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const enc = (o) => new TextEncoder().encode(JSON.stringify(o));
+const dec = (u) => new TextDecoder().decode(u);
+
+const term = new Terminal({ convertEol: false, fontFamily: 'ui-monospace, monospace', fontSize: 13, theme: { background: '#0d1117' } });
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit); term.open($('term')); fit.fit();
+
+let ws = null, hs = null, up = false, key = null;
+const seen = new Set();
+
+function setChip(s, cls) { $('chip').textContent = s; $('chip').className = cls; }
+
+async function connect() {
+  const url = $('url').value.trim();
+  const pairing = $('pairing').value.trim();
+  const token = $('token').value.trim() || null;
+  if (pairing.length < 32) { alert('PAIRING_SECRET must be >= 32 chars'); return; }
+  key = await genKeypair();
+  const psk = await derivePsk(pairing);
+  const room = await roomIdNow(pairing);
+  up = false; hs = null; seen.clear();
+  setChip('connecting…', 'off');
+
+  ws = new WebSocket(url);
+  const send = (o) => ws.send(JSON.stringify(o));
+  const sendEnc = (o) => send({ t: 'msg', to: 'controller', data: b64(hs.encrypt(enc(o))) });
+  window._sendEnc = (o) => up && sendEnc(o);
+
+  ws.onopen = () => send({ t: 'join', room, role: 'dashboard', peer: 'web-' + Math.random().toString(36).slice(2, 8), token });
+  ws.onclose = () => setChip('offline', 'off');
+  ws.onerror = () => setChip('error', 'off');
+  ws.onmessage = async (ev) => {
+    const env = JSON.parse(ev.data);
+    if (env.t === 'peer_join' && env.peer === 'controller') {
+      hs = new Initiator(key.priv, key.pub, psk); await hs.init();
+      send({ t: 'msg', to: 'controller', data: b64(await hs.writeMsg1()) });
+    } else if (env.t === 'peer_leave' && env.peer === 'controller') {
+      up = false; setChip('controller offline', 'off');
+    } else if (env.t === 'deliver') {
+      const by = unb64(env.data);
+      if (!up) {
+        await hs.readMsg2(by);
+        send({ t: 'msg', to: 'controller', data: b64(await hs.writeMsg3()) });
+        up = true; setChip('connected', 'idle');
+        sendEnc({ type: 'refresh', scope: 'full' });           // pull transcript history
+        const r = () => up && sendEnc({ type: 'resize', cols: term.cols, rows: term.rows });
+        term.onResize(r); r();
+      } else {
+        try { onMessage(JSON.parse(dec(hs.decrypt(by)))); } catch (e) { console.warn('decrypt', e); }
+      }
+    } else if (env.t === 'error') {
+      setChip('relay: ' + env.msg, 'off');
+    }
+  };
+}
+
+function onMessage(m) {
+  switch (m.type) {
+    case 'output': term.write(m.raw); break;
+    case 'event': setChip(m.state, m.state); break;
+    case 'notify': document.title = '🔔 dashboard'; setTimeout(() => (document.title = 'dashboard'), 1500); break;
+    case 'session': $('transcript').innerHTML = ''; break;            // new session → clear
+    case 'transcript': {
+      const k = `${m.msg_uuid}:${m.part_index}`; if (seen.has(k)) return; seen.add(k);
+      renderTranscript(m); break;
+    }
+  }
+}
+
+function renderTranscript(m) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + (m.role || '');
+  let html = `<div class="role">${m.role}</div>`;
+  for (const p of (m.parts || [])) {
+    if (p.kind === 'text') html += `<div>${escapeHtml(p.text)}</div>`;
+    else if (p.kind === 'thinking') html += `<div class="thinking">${escapeHtml(p.text)}</div>`;
+    else if (p.kind === 'tool_use') html += `<div class="tool">▸ ${escapeHtml(p.name)} ${escapeHtml(JSON.stringify(p.input))}</div>`;
+    else if (p.kind === 'tool_result') html += `<div class="tool">⟵ ${escapeHtml(typeof p.content === 'string' ? p.content : JSON.stringify(p.content)).slice(0, 2000)}</div>`;
+  }
+  div.innerHTML = html;
+  $('transcript').appendChild(div);
+  $('transcript').scrollTop = $('transcript').scrollHeight;
+}
+const escapeHtml = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+$('connect').onclick = connect;
+$('refresh').onclick = () => window._sendEnc?.({ type: 'refresh', scope: 'full' });
+$('ctrlc').onclick = () => window._sendEnc?.({ type: 'raw', text: '\x03' });
+$('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.value) { window._sendEnc?.({ type: 'input', text: e.target.value }); e.target.value = ''; }
+});
+window.addEventListener('resize', () => fit.fit());
+</script>
+</body>
+</html>
