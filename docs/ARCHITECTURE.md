@@ -607,15 +607,16 @@ trait AgentAdapter {
 
 ## 17. 已知缺口与评审待办（落地前须决议）
 
-本文经两轮独立多 agent 评审（对 claude v2.1.163 + tmux 3.4 + Cargo.lock 实测）。下列为尚未在正文展开、落地前须决议的横切项：
+本文经两轮独立多 agent 评审（对 claude v2.1.163 + tmux 3.4 + Cargo.lock 实测）。下列横切项已拆成 **GitHub issues** 跟踪（[全部 from-review](https://github.com/sanchuanhehe/claude-pty-controller/issues?q=is%3Aissue+label%3Afrom-review)）：
 
-- 🔴 **两个 BLOCKER 的方案落定**：(1) 入网抗主动 relay —— `PAIRING_SECRET` 强制高熵 vs 引入 PAKE（§14）；(2) 成对 E2EE 的 per-dashboard 扇出加密阶段（§13/§14）须真正进 §2 进程模型与 §7 背压。
-- **控制端 Dashboard 契约未规格化**：前端只在零散处提及；需单独定义其消费的规范 schema（§16.3）、`hello` 能力协商、重连/快照/去重行为。
-- **机密红action（未决策）**：claude 屏幕与 `tool_result` 会滚过 API key/密钥 → 通道一/二**虽 E2EE 但原样送达任何已授权 dashboard**。是否有意?至少文档化;考虑可选脱敏/打码。
-- **协议版本**：`hello` 播报 max `v` + 加法保 `v:1`/忽略未知（§16.3 ADP-5）已定方向，但需写出破坏性升级流程。
-- **缺整体规格的运维面**：错误/失败分类法、测试策略（尤其 OSC 状态机 / JSONL tail 的单元+模糊测试）、可观测性/指标、限流、审计日志、统一**配置 schema**（env/flag 优先级，§12 OPS-8）。
-- **录制/回放、屏幕快照（vt100）** 仍为 v2（§7）。
-- **依赖未验证**：`snow`/PAKE/`flock`/`sd-notify` 均未入 `Cargo.toml`（§6/§12）—— M4/M5 落地前补齐并 `cargo check`。
-- **平台**：原生 Windows `ConPtyHost`（mini-tmux 级工作量）+ msvc 工具链（§15）。
+- 🔴 **BLOCKER**（[#1](https://github.com/sanchuanhehe/claude-pty-controller/issues/1)）入网抗主动 relay —— `PAIRING_SECRET` 强制高熵 vs 引入 PAKE（§14）。
+- 🔴 **BLOCKER**（[#2](https://github.com/sanchuanhehe/claude-pty-controller/issues/2)）成对 E2EE 的 per-dashboard 扇出加密阶段须真正进 §2 进程模型与 §7 背压（§13/§14）。
+- **控制端 Dashboard 契约**（[#3](https://github.com/sanchuanhehe/claude-pty-controller/issues/3)）：规范 schema（§16.3）、`hello` 能力协商、重连/快照/去重。
+- **机密红action 决策**（[#4](https://github.com/sanchuanhehe/claude-pty-controller/issues/4)）：API key/密钥经通道一/二 E2EE 送达已授权 dashboard，是否有意 + 可选脱敏。
+- **协议版本**（[#5](https://github.com/sanchuanhehe/claude-pty-controller/issues/5)）：`hello` 播报 max `v` + 加法保 `v:1`/忽略未知（§16.3 ADP-5）+ 破坏性升级流程。
+- **运维面**（[#6](https://github.com/sanchuanhehe/claude-pty-controller/issues/6)）：配置 schema、结构化日志事件、错误分类、测试（OSC/JSONL 单元+模糊）、可观测、限流、审计（§12 OPS-8）。
+- **录制/回放 + vt100 快照**（[#7](https://github.com/sanchuanhehe/claude-pty-controller/issues/7)，v2，§7）。
+- **依赖未验证**（[#8](https://github.com/sanchuanhehe/claude-pty-controller/issues/8)）：`snow`/PAKE/`flock`/`sd-notify` 未入 `Cargo.toml`，M4/M5 前补齐 + `cargo check`（§6/§12）。
+- **原生 Windows `ConPtyHost`**（[#9](https://github.com/sanchuanhehe/claude-pty-controller/issues/9)，v2/v3）：mini-tmux 级工作量 + msvc 工具链（§15）。
 
-> 详细发现（含每条实测命令与证据）见各 §的 ⚠️ 评审注与 git 历史的两轮评审 commit。
+> 详细发现（含每条实测命令与证据）见各 §的 ⚠️ 评审注、上述 issues 与 git 历史的两轮评审 commit。
