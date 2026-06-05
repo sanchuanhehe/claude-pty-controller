@@ -238,12 +238,13 @@ claude 在 pane 里会进入各种非常规对话状态：`/resume` 选择器、
 
 **据此分通道**（通道一 v1 已覆盖前台；多会话 fan-out 为 v2）：
 
-- **通道二（多会话并发 tail）**：从发现面 1/2 拿到会话集合 → 各自解析转写路径 → **并发 tail**（每文件独立换行游标，§3.2）→ 每条标注 `sessionId`/`name`/`kind`。后台 agent 与前台交互会话**一视同仁**，Dashboard 可分流 / 列表展示。
-- **通道三（状态，免 OSC）**：后台 agent 无前台终端，其 `status`（busy/idle）+ `updatedAt` 直接从 `sessions/<pid>.json` / `agents --json` 读，**不必解析 OSC**；前台交互会话仍走 OSC `tab_status`（§3.3）。两路都喂 `refresh_tx`（§3.2 回合结束触发）。
-- **通道一（屏幕）**：前台交互会话 = 控制器的 tmux pane（如常）。**后台 agent 无前台画面**，v1 仅以"转写 + 状态"两路呈现；`claude agents` 的 agent view TUI 本身只是 pane 里一屏，通道一透明可见可驱动。
-  - *v2 探索（不依赖）*：daemon 为每个后台 agent 暴露 `ptySock`，理论上控制器可连该 unix 套接字流式取 / 驱其屏。但这是 daemon 内部协议（`proto:1`、rendezvous/pty 双 socket），**版本敏感、未公开**，仅作探索项，绝不作 v1 依赖。
+- **通道二（多会话并发 tail）**：从发现面拿到会话集合 → **按 `sessionId` → 精确 `<sessionId>.jsonl` 路径** 打开（**不要**用"目录内最近增长的文件"做归属——后台 agent 无 tab_status 窗口可消歧，§3.2 sanitize 又会撞目录）→ 并发 tail。⚠️ **大文件灌洪（评审）**：后台 agent 转写实测可达 **59MB**;首次锁定**别从 offset 0 重放全历史**(超 1024 槽有界 channel 且会 head-of-line 阻塞前台 tail) → 首锁 seek 到近 N 行/分页回填,后台回填走**低优先级独立 lane**,历史按需由 Dashboard `refresh:full` 拉。
+- **通道三（状态）**：⚠️ **`status:busy` ≠ 回合进行中（评审,实测）**:`sessions/*.json` 的 `status` 是**进程是否在工作**,与回合边界不同轴(同一 agent `status:busy` 而其 `jobs/<id>/state.json` 已 `done`)。故后台 agent **没有"回合结束"边沿信号**,§3.2 路径 2 的低延迟刷新对它**不适用** → 后台通道二退化为**轮询**,或"回合结束"改由**通道二内容自身**判定(新 assistant 行落盘)。前台仍走 OSC `tab_status`。
+  - ⚠️ **活性不能只看 `updatedAt`（评审,实测）**:`agents --json` 之所以可信是它对每个 pid 做了 `process.kill(pid,0)/ESRCH` 探活,而 `sessions/<pid>.json` 仅在**优雅退出**时删除 —— 崩溃/OOM 会留下**陈旧 pid 文件**,fan-out 会把死 agent 当活的一直 tail,且 pid 复用会张冠李戴。→ 发现循环须**自己对每个 pid `kill(pid,0)` 探活** + `updatedAt` 陈旧阈值,按 `sessionId`(非 pid)对账。
+- **通道一（屏幕）**：前台交互会话 = 控制器的 tmux pane（如常）。⚠️ **后台 agent 并非"无屏"（评审,实测）**:它跑在一个 **daemon 持有的真实 PTY**（`/dev/pts/*`,229x64,全鼠标+bracketed-paste DEC modes）上、照发同样的 OSC,只是没接到控制器的 pane —— 经 `ptySock` 即可取其屏与原生 OSC。v1 对后台只用"转写+状态"是**有意的范围裁剪,不是信号不存在**。
+  - *v2 探索（不依赖）*：连后台 agent 的 `ptySock`（其属主是 `--bg-pty-host` **父进程**,pid 与 `sessions/*.json` 的 claude **子进程** pid 不同,实测 PPID 关系）即可流式取/驱其屏,与 tmux attach 对称。daemon 内部协议(`proto:1`)版本敏感、未公开,仅探索。
 
-> 本节相比上一版（基于旧源码 swarm/tmux 的猜测）已**改为实测 daemon + `claude agents --json` + `~/.claude/sessions/*.json`** 的确定面。即便未来版本调整发现面，§3.2.1 的"按文件 + 行内 `sessionId`"仍是地板，架构不动。
+> 本节为**实测 daemon + `claude agents --json` + `~/.claude/sessions/*.json`** 的确定面（round-2 评审已修正"后台无屏 / status=回合 / updatedAt=活性"三处误述）。即便未来发现面变,§3.2.1 的"按 `sessionId` 精确取文件"仍是地板。
 
 ## 4. 入站协议（远程 → PTY）
 
@@ -536,10 +537,16 @@ trait AgentAdapter {
     // 通道三
     fn status_strategy(&self) -> StatusStrategy;          // Osc | TranscriptDerived | Registry | ScreenHeuristic | None
     fn parse_status(&self, input: StatusInput) -> Option<StatusEvent>;            // → 规范
+
+    // 入站（评审 ADP-1：原缺，输入侧也是 agent 专属）—— 把规范动作映射成该 agent 的字节序列
+    fn encode_input(&self, cmd: InboundCmd) -> Vec<PtyWrite>;
+    // InboundCmd = Submit | Interrupt | Eof | Key(chord) | Paste(text) | Resize{cols,rows} | Refresh{scope}
+    // ClaudeAdapter: Submit→"\r"、Interrupt→0x03、Eof→0x04、Paste→bracketed-paste、Resize→master.resize
 }
 ```
 
-核心不认识任何 agent，只调 trait。Adapter 选择：按启动命令名映射 / `--adapter <id>` 显式 / 默认 `GenericAdapter`（仅通道一 + 可选屏幕启发式状态）。
+核心不认识任何 agent，只调 trait。Adapter 选择：按启动命令名映射 / `--adapter <id>` 显式 / 默认 `GenericAdapter`（仅通道一 + raw 字节透传 + 可选屏幕启发式状态）。
+> ⚠️ **输入侧曾是 TODO（评审 ADP-1）**：§4 的 `input`(追加 `\r`)/`raw`/`refresh` 是 Claude/键盘形状,硬编进核心则"换 agent 改核心"。故 `encode_input` 上提到 trait：`Submit`/`Interrupt`/键位/粘贴由 adapter 翻译,`Resize` 留核心(SIGWINCH 通用),`refresh` 仅在 `capabilities.transcript` 时有意义。**零-adapter 只保证"观看(屏幕镜像)";"驱动"在无输入映射时仅 raw 字节尽力而为**（ADP-8）。
 
 ### 16.3 规范化线缆 schema（Dashboard 面向它 → 换 adapter 前端零改）
 
@@ -547,21 +554,28 @@ trait AgentAdapter {
 // 通道一（通用，多会话加 session 标签）
 {"type":"output","session":"<id>","raw":"…"}
 
+// 握手（评审 ADP-4：连接时 + agent/会话变更时发，让前端预知能力，区分"无转写"与"暂时静默"）
+{"type":"hello","v":1,"agent":"claude","capabilities":{"transcript":true,"status":true,"multi_session":true,"input":true}}
+
 // 通道二：规范转写事件（+ raw 逃生舱保真）
 {"type":"transcript","v":1,"agent":"claude","session":"<id>","ts":169..,
  "role":"user|assistant|tool|system",
  "parts":[ {"kind":"text","text":"…"}
+         | {"kind":"thinking","text":"…"}                      // 评审 ADP-2：实测有 thinking 块,须建模否则丢
          | {"kind":"tool_use","id":"…","name":"Bash","input":{…}}
-         | {"kind":"tool_result","forId":"…","content":"…"} ],
- "raw":{…}}                       // agent 原生记录，供高保真/调试，可选
+         | {"kind":"tool_result","forId":"…","content":"… | [blocks]"} ],  // ADP-3：content 可为字符串或块数组(含图片)
+ "msgUuid":"…","partIndex":0,        // 评审 ADP-7：一条 JSONL 行可展开成多事件 → 去重 key = (msgUuid, partIndex),非裸 uuid
+ "raw":{…}}                          // agent 原生记录;含 thinking/图片/结构化内容时 raw 不可省
 
-// 通道三：规范状态事件
+// 通道三：规范状态（稳态）+ 通知（边沿）—— 评审 ADP-6：notify 是一次性边沿,不是状态,拆开
 {"type":"event","v":1,"agent":"claude","session":"<id>",
- "state":"idle|working|waiting|notify",   // 见下「状态映射」——只列 adapter 真能产出的
+ "state":"idle|working|waiting",          // 稳态,三选一
  "detail":{…},"raw":{…}}
+{"type":"notify","v":1,"agent":"claude","session":"<id>","raw":{…}}   // 边沿,尽力而为(bell),不可当权威回合结束
 ```
 
-**状态映射（ClaudeAdapter）**：claude 的 OSC `tab_status` 实测仅 `Idle/Working…/Waiting`（§3.3，无 "approval" 信号）→ 规范 `idle/working/waiting`；`notify` 仅在收到 bell 时（尽力而为）。**不臆造 `awaiting_approval`**——若某 adapter 有真信号可填更多状态，再按需扩 enum 并在该 adapter 文档注明来源；规范 enum 只承诺各 adapter 能落地的子集。
+**状态映射（ClaudeAdapter，实测）**：claude OSC `tab_status` 恰为 `Idle/Working…/Waiting`（§3.3，二进制核对无 approval）→ 规范 `idle/working/waiting`。**不臆造 `awaiting_approval`**。`notify` 拆成独立边沿消息（仅 bell 时、尽力而为）——**回合结束的权威信号仍是 `tab_status` 跃迁**,前端勿把 `notify` 当回合界。其它 adapter 有真信号可扩 enum,但须在其文档注明来源；规范 enum 只承诺各 adapter 能落地的子集。
+> **schema 版本策略（评审 ADP-5）**：加法变更（新 `kind`/新 `state`/新可选字段）保持 `v:1`,前端**忽略未知**;仅破坏性变更升 `v`,并由 `hello` 播报控制器支持的最高 `v` 供前端降级告警。§1 所谓"协商"即此 `hello` 播报 + 忽略未知,非双向谈判。
 
 > 相对 §3 的 Claude 原生载荷的演进 = **规范字段 + `raw` 逃生舱**。ClaudeAdapter 既填规范 `parts`/`state`、也带 `raw`（Claude JSONL 行 / 原始 OSC），保真不丢；前端按规范 schema 写，任何 adapter 通用。**入站同理**：§4 的 `input/raw/resize/refresh` 也属 adapter 面（输入映射），新 agent 若键位 / 命令不同需在 adapter 内翻译（§16 待补输入侧 trait 方法）。
 
