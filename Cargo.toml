@@ -1,0 +1,30 @@
+[package]
+name = "claude-pty-controller"
+version = "0.1.0"
+edition = "2021"
+description = "Remotely observe and drive a Claude Code terminal session over WebSocket — single static binary."
+license = "MIT"
+
+[dependencies]
+portable-pty = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Optional (see docs/ARCHITECTURE.md):
+# notify = "6"      # JSONL inotify instead of polling
+# vt100  = "0.15"   # screen snapshot for reconnects
+# base64 = "0.22"   # channel-1 base64 mode
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

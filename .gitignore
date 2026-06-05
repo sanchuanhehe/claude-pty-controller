@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
